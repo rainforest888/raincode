@@ -613,7 +613,44 @@ fn main() -> Result<()> {
         .ok();
     let cli = Cli::parse();
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
-    runtime.block_on(async_main(cli))
+    match runtime.block_on(async_main(cli)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("[error] {e:#}");
+            print_error_hint(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 根据错误内容给出可操作提示(I2 交互性)。
+fn print_error_hint(err: &anyhow::Error) {
+    let s = format!("{e:#}", e = err).to_lowercase();
+    let hint = if s.contains("503") || s.contains("429") || s.contains("500") || s.contains("502")
+        || s.contains("504") || s.contains("provider error") || s.contains("transport error")
+    {
+        "模型端点暂时不可用。稍后重试,或用 --pool 指定另一个模型(如 --pool deepseek-v4-flash)。"
+    } else if s.contains("no provider profiles") || s.contains("no active provider")
+        || s.contains("no model configured") || s.contains("model configured to route")
+        || s.contains("profiles configured") || s.contains("model add")
+    {
+        "还没有配置模型。运行 `raincode setup` 交互式配置。"
+    } else if s.contains("api key") || s.contains("401") || s.contains("403") || s.contains("auth")
+        || s.contains("unauthorized") || s.contains("invalid key")
+    {
+        "API key 缺失或无效。运行 `raincode setup` 重新配置 key(存在 ~/.raincode/keys/)。"
+    } else if s.contains("compile") || s.contains("cargo check") || s.contains("error[") {
+        "编译/检查失败,看上面 cargo 输出;修改后重试。"
+    } else if s.contains("connect") || s.contains("network") || s.contains("timed out")
+        || s.contains("timeout")
+    {
+        "网络连接问题。检查能否直连该 provider;外网可走 Clash 代理(127.0.0.1:7890)。"
+    } else if s.contains("no session") {
+        "没有可恢复的会话,先运行 `raincode run \"任务\"`。"
+    } else {
+        "如反复失败:`raincode setup` 检查配置,或 `raincode route --plan-only` 先预览拆解。"
+    };
+    eprintln!("[hint] {hint}");
 }
 
 async fn async_main(cli: Cli) -> Result<()> {
