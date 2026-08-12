@@ -44,6 +44,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing_subscriber::EnvFilter;
 
+mod enrich;
+
 /// Hosting-CLI environment for the raincode-tui REPL. Bridges every CLI-side
 /// helper (registry / store / providers / skills / slash dispatch) into the
 /// TUI's [`raincode_tui::repl::env::ReplEnv`] trait so the REPL never depends
@@ -469,6 +471,22 @@ enum ProfilesCmd {
     Show,
     /// Fetch model profiles from OpenRouter and normalize them into the state DB.
     Refresh,
+    /// Agentic refresh: research top-N most-used models' pricing/scores from the web and
+    /// enrich the model score library (keep latest versions, delete old).
+    Enrich {
+        /// Comma-separated extra models to research beyond the popularity top-N (e.g. glm-5.2,kimi-k3).
+        #[arg(long)]
+        add: Option<String>,
+        /// How many models to take from the external popularity leaderboard (default 15).
+        #[arg(long)]
+        top: Option<usize>,
+        /// Provider profile id for the research agent (default: active profile).
+        #[arg(long)]
+        model: Option<String>,
+        /// Print what would change without writing to the DB.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2289,7 +2307,7 @@ fn normalize_arena_elo(elo: f64) -> f64 {
     ((elo - 1000.0) / 400.0 * 100.0).clamp(0.0, 100.0)
 }
 
-async fn profiles_command(_config: &FileConfig, cmd: ProfilesCmd) -> Result<()> {
+async fn profiles_command(config: &FileConfig, cmd: ProfilesCmd) -> Result<()> {
     let store = Store::open(state_path())?;
     match cmd {
         ProfilesCmd::Show => {
@@ -2305,6 +2323,19 @@ async fn profiles_command(_config: &FileConfig, cmd: ProfilesCmd) -> Result<()> 
         ProfilesCmd::Refresh => {
             let n = refresh_profiles(&store).await?;
             println!("refreshed {n} models");
+            Ok(())
+        }
+        ProfilesCmd::Enrich { add, top, model, dry_run } => {
+            let add: Vec<String> = add
+                .as_deref()
+                .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+                .unwrap_or_default();
+            enrich::enrich_command(config, enrich::EnrichArgs {
+                add,
+                top: top.unwrap_or(15),
+                model,
+                dry_run,
+            }).await?;
             Ok(())
         }
     }
