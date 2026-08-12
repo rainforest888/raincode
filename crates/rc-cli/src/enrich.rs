@@ -6,6 +6,10 @@ use anyhow::Result;
 use serde::Deserialize;
 use crate::FileConfig;
 
+/// OpenRouter 公开模型列表端点(无需 key)。返回 data 数组,每项含 id、
+/// context_length、pricing(prompt/completion 每 token 单价)与 benchmarks。
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+
 pub struct EnrichArgs {
     pub add: Vec<String>,
     pub top: usize,
@@ -97,9 +101,32 @@ pub async fn enrich_command(_config: &FileConfig, _args: EnrichArgs) -> Result<(
     Err(anyhow::anyhow!("enrich: not implemented yet"))
 }
 
+/// 拉取 OpenRouter /api/v1/models 原始 JSON(薄 reqwest 包装,可测部分在
+/// [`baseline_from_json`])。
+async fn fetch_openrouter_raw() -> Result<String> {
+    let resp = reqwest::Client::new()
+        .get(OPENROUTER_MODELS_URL)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(resp.text().await?)
+}
+
+/// 纯函数:OpenRouter 原始 JSON → 能力档案行。定价 ×1e6(每 token → 每百万),
+/// 榜单分按人工分析/design-arena 归一化,详情见 `parse_openrouter_models`。
+fn baseline_from_json(raw: &str) -> Result<Vec<rc_state::CapabilityProfileRow>> {
+    Ok(crate::parse_openrouter_models(raw)?)
+}
+
+/// 确定性基准:拉取 OpenRouter 模型列表并转成能力档案行(不命中网络的可测
+/// 核心是 `baseline_from_json`,此处仅补一次 HTTP)。
+async fn fetch_openrouter_baseline() -> Result<Vec<rc_state::CapabilityProfileRow>> {
+    baseline_from_json(&fetch_openrouter_raw().await?)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_agent_output;
+    use super::{baseline_from_json, parse_agent_output};
 
     #[test]
     fn parse_agent_output_accepts_fenced_json() {
@@ -115,5 +142,19 @@ mod tests {
     #[test]
     fn parse_agent_output_rejects_no_json() {
         assert!(parse_agent_output("完全没有 JSON").is_err());
+    }
+
+    #[test]
+    fn baseline_scales_pricing_and_keeps_scores() {
+        // Canned OpenRouter payload: pricing is per-token (0.000002/0.000006),
+        // so baseline must scale ×1e6 to per-1M; scores pass through normalized.
+        let json = r#"{"data":[{"id":"qwen/qwen3.8-max","context_length":1000000,
+            "pricing":{"prompt":"0.000002","completion":"0.000006"},
+            "benchmarks":{"artificial_analysis":{"intelligence_index":58.1,"coding_index":71.8},
+                          "design_arena":[{"category":"website","elo":1295}]}}]}"#;
+        let rows = baseline_from_json(json).unwrap();
+        assert_eq!(rows[0].input_cost_per_m, 2.0);       // 0.000002 * 1e6
+        assert_eq!(rows[0].coding, 71.8);
+        assert!((rows[0].frontend - 73.75).abs() < 0.01); // (1295-1000)/400*100
     }
 }

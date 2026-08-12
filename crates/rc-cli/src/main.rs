@@ -2253,7 +2253,7 @@ struct DesignArenaEntry {
 
 /// 解析 OpenRouter /api/v1/models 的 data 数组 → CapabilityProfileRow
 /// (能力分暂用种子同名回退,定价/窗口取真实值)。
-fn parse_openrouter_models(raw: &str) -> Result<Vec<rc_state::CapabilityProfileRow>, serde_json::Error> {
+pub(crate) fn parse_openrouter_models(raw: &str) -> Result<Vec<rc_state::CapabilityProfileRow>, serde_json::Error> {
     #[derive(Deserialize)]
     struct Wrapper {
         data: Vec<OpenRouterModel>,
