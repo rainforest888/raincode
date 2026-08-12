@@ -1637,11 +1637,20 @@ async fn run_prompt(
         false, // CLI 一次性 run:无实时 chat 循环,不装配 run_slash_command 工具
     )
     .await?;
+    let model_id = agent_cfg.provider.id().to_string();
+    let agent_name = agent_cfg
+        .agent
+        .clone()
+        .unwrap_or_else(|| DEFAULT_AGENT.to_string());
+    let start = std::time::Instant::now();
+    // I4:运行状态可见性 — 开始时显示模型/agent/会话。
+    eprintln!("→ 模型: {model_id} | agent: {agent_name} | 会话: {}", &session.id[..8]);
     let agent = Agent::new(agent_cfg);
     let mut stream = agent.run(session.id.clone(), prompt.to_string());
     while let Some(event) = stream.next().await {
         print_event(&event);
     }
+    eprintln!("\n✓ 结束,耗时 {:?}", start.elapsed());
     Ok(())
 }
 
