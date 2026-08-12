@@ -835,9 +835,10 @@ fn network_policy(config: &FileConfig) -> NetworkPolicy {
     NetworkPolicy {
         allow_hosts: config.sandbox.network.allow_hosts.clone(),
         deny_hosts: config.sandbox.network.deny_hosts.clone(),
+        // 默认放行(web_fetch/web_search 开箱即用);显式 `default = "deny"` 才收紧。
         default: match config.sandbox.network.default.as_deref() {
-            Some("allow") => PolicyDefault::Allow,
-            _ => PolicyDefault::Deny,
+            Some("deny") => PolicyDefault::Deny,
+            _ => PolicyDefault::Allow,
         },
     }
 }
