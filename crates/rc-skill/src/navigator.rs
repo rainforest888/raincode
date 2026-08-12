@@ -67,6 +67,13 @@ impl<'a> SkillNavigator<'a> {
         }
         let child = self.network.nodes.iter().find(|n| n.skill.name == choice)
             .ok_or_else(|| format!("skill {choice} not found"))?;
+        // 分支必须是当前 skill 的子节点(menu 只列子分支)。跨分支跳转会把导航
+        // "传送"到树形拓扑之外,绕过 per-frame visited 防绕圈(软引用可构成交叉环)。
+        if !self.network.children_of(&current_skill).iter().any(|n| n.skill.name == choice) {
+            return Err(format!(
+                "skill {choice} is not a child of {current_skill}; only menu branches can be descended into"
+            ));
+        }
         // 叶子 → 返回正文。
         if child.is_leaf {
             return Ok(NavAction::AtLeaf { body: child.skill.body.clone() });
@@ -215,6 +222,31 @@ mod tests {
         let mut stack = vec![frame("react", nav.menu("react"))];
         let err = nav.descend(&mut stack, "no.such.skill").unwrap_err();
         assert!(err.contains("no.such.skill"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn navigator_descend_rejects_non_child_skill() {
+        // 跨分支跳转防护:choice 在 network 中存在,但非当前 skill 的子节点
+        // (如无关根级 skill)→ 必须报错且不 push frame;否则导航可绕过树形
+        // 拓扑与 per-frame visited 防绕圈(软引用可构成交叉环,预算兜底前会绕圈)。
+        let dir = tempfile::tempdir().unwrap();
+        let store = SkillStore::new(dir.path());
+        store.save(&skill_with("react", "react framework", "frontend", "INDEX_BODY")).unwrap();
+        store.save(&skill_with("react.performance", "react performance", "frontend.react", "full body")).unwrap();
+        // docker-debug 在 network 中存在,但物理目录不在 frontend/ 下 → 不是 react 的子。
+        store.save(&skill_with("docker-debug", "debug docker", "devops", "docker body")).unwrap();
+        let net = SkillNetwork::from_store(&store);
+        let nav = SkillNavigator { network: &net, limits: NavigatorLimits::default() };
+        let mut stack = vec![frame("react", nav.menu("react"))];
+
+        // 存在的 skill 但非当前 frame 的子 → 拒绝,且不 push frame。
+        let err = nav.descend(&mut stack, "docker-debug").unwrap_err();
+        assert!(err.contains("not a child"), "unexpected err: {err}");
+        assert_eq!(stack.len(), 1, "rejected descent must not push a frame");
+
+        // 控制组:合法子节点仍可下钻(叶子 → 正文)。
+        let action = nav.descend(&mut stack, "react.performance").unwrap();
+        assert_eq!(action, NavAction::AtLeaf { body: "full body".into() });
     }
 
     #[test]

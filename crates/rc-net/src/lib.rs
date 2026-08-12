@@ -24,6 +24,10 @@ pub enum NetError {
     Search(String),
 }
 
+/// Cap on how many characters of fetched page text are handed back to the
+/// caller, so large pages don't flood the agent context with tokens.
+const MAX_FETCH_CHARS: usize = 20_000;
+
 #[derive(Debug, Clone)]
 pub struct FetchResult {
     pub url: String,
@@ -53,7 +57,9 @@ fn default_max_results() -> usize {
 }
 
 /// Fetch a URL and return a plain-text/markdown-ish representation. HTML is
-/// stripped to text so provider contexts stay compact.
+/// stripped to text so provider contexts stay compact. Output longer than
+/// [`MAX_FETCH_CHARS`] characters is truncated with a `...[truncated: N chars]`
+/// marker.
 pub async fn fetch_url(url: &str, policy: &NetworkPolicy) -> Result<FetchResult, NetError> {
     check_policy(policy, url)?;
     let client = reqwest::Client::builder()
@@ -78,12 +84,27 @@ pub async fn fetch_url(url: &str, policy: &NetworkPolicy) -> Result<FetchResult,
         .await
         .map_err(|e| NetError::Transport(e.to_string()))?;
     let title = extract_title(&body);
-    let markdown = html_to_text(&body);
+    let markdown = truncate_text(html_to_text(&body), MAX_FETCH_CHARS);
     Ok(FetchResult {
         url: url.to_string(),
         title,
         markdown,
     })
+}
+
+/// Keep the first `max` bytes of `text`; if anything was cut off, append
+/// a marker reporting how many characters were dropped. The cut never splits
+/// a UTF-8 character in half.
+fn truncate_text(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let removed = text[end..].chars().count();
+    format!("{}...[truncated: {removed} chars]", &text[..end])
 }
 
 /// Search the web. When `config.endpoint` is set it is called as an
@@ -328,6 +349,74 @@ mod tests {
     fn strips_html_tags() {
         let html = "<html><head><title>T</title></head><body><p>Hello &amp; bye</p></body></html>";
         assert_eq!(html_to_text(html), "T Hello & bye");
+    }
+
+    #[test]
+    fn truncates_long_text_with_marker() {
+        let out = truncate_text("a".repeat(25_000), MAX_FETCH_CHARS);
+        assert_eq!(
+            out,
+            format!("{}...[truncated: 5000 chars]", "a".repeat(20_000))
+        );
+    }
+
+    #[test]
+    fn leaves_short_text_untouched() {
+        let short = "short page".to_string();
+        assert_eq!(truncate_text(short, MAX_FETCH_CHARS), "short page");
+    }
+
+    #[test]
+    fn text_exactly_at_cap_is_not_truncated() {
+        let exact = "a".repeat(MAX_FETCH_CHARS);
+        assert_eq!(truncate_text(exact.clone(), MAX_FETCH_CHARS), exact);
+    }
+
+    #[test]
+    fn multibyte_text_exactly_at_cap_is_kept_whole() {
+        // 6666 个"界"恰好 19998 字节,补 2 个 ASCII 字节正好等于 20000 字节上限,
+        // 且上限落在 ASCII 字节上,无需回退、不应截断。
+        let mut exact = "界".repeat(6666);
+        exact.push_str("ab");
+        assert_eq!(exact.len(), MAX_FETCH_CHARS);
+        assert_eq!(truncate_text(exact.clone(), MAX_FETCH_CHARS), exact);
+    }
+
+    #[test]
+    fn empty_text_stays_empty() {
+        assert_eq!(truncate_text(String::new(), MAX_FETCH_CHARS), "");
+        assert_eq!(truncate_text(String::new(), 0), "");
+    }
+
+    #[test]
+    fn truncates_even_at_zero_cap() {
+        // 上限为 0:保留空串,剩余字符全部计入 marker。
+        let out = truncate_text("abc".to_string(), 0);
+        assert_eq!(out, "...[truncated: 3 chars]");
+    }
+
+    #[test]
+    fn truncation_respects_byte_cap_and_reports_chars() {
+        // 混合字节宽度的文本:上限按字节截断,marker 报告的是被丢弃的字符数。
+        // 19998 字节处开始"界"(3 字节),20000 上限落在"界"中间 → 回退到 19998。
+        let mixed = format!("{}界{}", "a".repeat(19_998), "b".repeat(20));
+        let out = truncate_text(mixed.clone(), MAX_FETCH_CHARS);
+        assert!(out.starts_with(&"a".repeat(19_998)));
+        assert!(out.ends_with("...[truncated: 21 chars]"));
+        assert!(!out.contains('界'));
+        assert!(!out.contains('b'));
+    }
+
+    #[test]
+    fn truncates_on_utf8_char_boundary() {
+        // Each 界 is 3 bytes; a 20000-byte boundary would split one in half,
+        // so the cut must land at 19998 bytes (6666 chars), dropping 14334.
+        let long = "界".repeat(21_000);
+        let out = truncate_text(long, MAX_FETCH_CHARS);
+        assert_eq!(
+            out,
+            format!("{}...[truncated: 14334 chars]", "界".repeat(6666))
+        );
     }
 
     #[test]
