@@ -3,8 +3,16 @@
 //! merge that keeps latest versions / deletes old / upserts / prints a summary.
 
 use anyhow::Result;
-use serde::Deserialize;
+use futures::StreamExt;
+use rc_core::{Agent, AgentConfig};
+use rc_net::{tools::network_tools, SearchConfig};
+use rc_profile::Registry;
+use rc_proto::AgentEvent;
+use rc_sandbox::{AutoApproveHook, AutoUserHook, CommandPolicy, NetworkPolicy};
+use rc_skill::SkillStore;
 use rc_state::{CapabilityProfileRow, Store};
+use rc_tool::builtin::default_tools;
+use serde::Deserialize;
 use crate::FileConfig;
 
 /// OpenRouter 公开模型列表端点(无需 key)。返回 data 数组,每项含 id、
@@ -141,6 +149,125 @@ fn extract_json_object(text: &str) -> Option<String> {
 pub fn parse_agent_output(raw: &str) -> Result<ResearchReport> {
     let json = extract_json_object(raw).ok_or_else(|| anyhow::anyhow!("no JSON object in research agent output"))?;
     Ok(serde_json::from_str(&json)?)
+}
+
+/// 研究 agent 提示词构建:给定目标裸名列表与榜单 top N,产出 JSON 输出契约。
+/// 纯函数(可测);真实调用在 enrich_command(Task 8 编排)。
+#[allow(dead_code)] // wired by enrich_command (Task 8)
+pub fn build_research_prompt(targets: &[String], top: usize) -> String {
+    format!(
+        "You are researching model pricing and benchmark scores for a coding-agent model pool.\n\
+         Anchor sources: LMArena leaderboard (popularity), OpenRouter /api/v1/models (Artificial-Analysis \
+         + Design-Arena scores), Artificial Analysis, and the opencode.ai pricing page.\n\
+         Steps:\n\
+         1) Identify the top {} most-used models from the external popularity leaderboard (LMArena votes; \
+         fall back to OpenRouter's popular list if unreachable).\n\
+         2) For each, determine the LATEST version id and its pricing: prefer the opencode.ai price you can \
+         find on the web; if not found set \"price_source\": \"missing\".\n\
+         3) If a model is missing frontend/backend scores, fill estimates from Artificial Analysis or the \
+         official model page.\n\
+         Extra models to research too: {}.\n\
+         Return your final answer as a single JSON object (no prose before/after): {{\"popular\":[...], \
+         \"models\":[{{\"id\":\"<latest version id>\",\"latest\":true,\"input_cost_per_m\":<num or null>,\
+         \"output_cost_per_m\":<num or null>,\"price_source\":\"opencode|openrouter|missing\",\
+         \"reasoning\":<0-100 or null>,\"coding\":<0-100 or null>,\"frontend\":<0-100 or null>,\
+         \"backend\":<0-100 or null>,\"math\":<0-100 or null>,\"long_context\":<0-100 or null>,\
+         \"context_window\":<num>}}]}}",
+        top,
+        if targets.is_empty() { "(none)".to_string() } else { targets.join(", ") },
+    )
+}
+
+/// 一次性研究子代理:装配 default_tools(去掉 delegate_research 防递归派发)+
+/// 网络工具(web_fetch/web_search),跑研究提示词并返回最终文本(应含 JSON)。
+/// 交互定价兜底发生在 agent 返回之后的 enrich_command(Task 8),因此这里用
+/// AutoUserHook 不请求用户输入。守卫照 agent_config 工厂镜像加载 supervise.toml;
+/// 无 guard_hook → 高危操作保守拦截(研究 agent 只读网络)。
+#[allow(dead_code)] // wired by enrich_command (Task 8)
+async fn run_research_agent(
+    config: &FileConfig,
+    registry: &Registry,
+    model_id: Option<&str>,
+    prompt: &str,
+) -> Result<String> {
+    let provider = crate::provider_for_profile(registry, model_id)?;
+    let skill_dir = crate::skills_dir(config);
+    let store = Store::open(crate::state_path())?;
+    let skill_store = SkillStore::new(&skill_dir);
+    let cwd = config
+        .core
+        .workspace
+        .as_deref()
+        .map(crate::expand_tilde)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+
+    let mut tools = default_tools(skill_store.clone());
+    tools.retain(|t| t.spec().name != "delegate_research");
+    tools.extend(network_tools(SearchConfig::default()));
+
+    // 监督守卫:从 ~/.raincode/supervise.toml 加载(缺失默认守卫全开;坏 TOML 记
+    // warn 并关闭守卫)。与 main.rs agent_config 工厂同源。
+    let guard_cfg = match rc_sandbox::load_supervise_config(&crate::raincode_home()) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!("supervise.toml 解析失败,守卫关闭: {e}");
+            None
+        }
+    };
+    let guard_memo = guard_cfg
+        .as_ref()
+        .map(|_| std::sync::Arc::new(rc_sandbox::guard_hook::SessionGuardMemo::default()));
+    let guard_home = guard_cfg.as_ref().map(|_| crate::raincode_home());
+
+    let session = store.create_session(&cwd.to_string_lossy())?;
+    let cfg = AgentConfig {
+        provider,
+        plan_provider: None,
+        review_provider: None,
+        store,
+        skill_store,
+        tools,
+        approval: std::sync::Arc::new(AutoApproveHook),
+        command_policy: CommandPolicy::default(),
+        network_policy: NetworkPolicy::default(),
+        cwd,
+        state_path: crate::state_path(),
+        max_turns: 8,
+        max_steps: 0,
+        evolve_on_finish: false,
+        plan_mode: false,
+        hooks: config.hooks.clone(),
+        agent: Some("researcher".into()),
+        max_history_bytes: Some(128 * 1024),
+        mcp_servers: vec![],
+        entropy_mode: false,
+        plan_max_rounds: 1,
+        plan_max_questions: 1,
+        review_max_rounds: 1,
+        max_cycles: 1,
+        user_input: std::sync::Arc::new(AutoUserHook::default()),
+        steer_rx: None,
+        context_window: 0,
+        subagent: None,
+        guard_cfg,
+        guard_hook: None,
+        guard_memo,
+        guard_home,
+    };
+    let agent = Agent::new(cfg);
+    let mut stream = agent.run(session.id, prompt.to_string());
+    let mut final_text = String::new();
+    while let Some(ev) = stream.next().await {
+        match ev {
+            AgentEvent::Token { delta } => final_text.push_str(&delta),
+            AgentEvent::Done { summary, .. } => final_text = summary,
+            AgentEvent::Error { message } => {
+                return Err(anyhow::anyhow!("research agent error: {message}"))
+            }
+            _ => {}
+        }
+    }
+    Ok(final_text.trim().to_string())
 }
 
 pub async fn enrich_command(_config: &FileConfig, _args: EnrichArgs) -> Result<()> {
@@ -304,6 +431,14 @@ pub async fn apply_enrichment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_research_prompt_mentions_top_and_targets() {
+        let p = build_research_prompt(&["glm-5.2".into()], 15);
+        assert!(p.contains("top 15"));
+        assert!(p.contains("glm-5.2"));
+        assert!(p.contains("openrouter"));
+    }
 
     #[test]
     fn parse_agent_output_accepts_fenced_json() {
