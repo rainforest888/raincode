@@ -1,7 +1,9 @@
-# Raincode 安装脚本(Windows PowerShell)
-# 用法:在仓库根执行  powershell -ExecutionPolicy Bypass -File install.ps1
-# 效果:构建 release → 复制 raincode.exe 到 ~/.raincode/bin → 加入用户 PATH。
-# 之后在任何文件夹的终端输入 `raincode` 即可打开。
+# Raincode installer (Windows PowerShell)
+# Usage: from the repo root, run:
+#   powershell -ExecutionPolicy Bypass -File install.ps1
+# What it does: builds the release binary, copies raincode.exe to
+# ~/.raincode/bin, and adds that dir to the user PATH so you can type
+# `raincode` in any terminal.
 
 $ErrorActionPreference = "Stop"
 
@@ -9,31 +11,33 @@ $Repo = $PSScriptRoot
 $Bin = Join-Path $HOME ".raincode\bin"
 $Exe = Join-Path $Repo "target\release\raincode.exe"
 
-# 1) 确保 release 存在(没有就构建)
+# 1) Ensure the release binary exists (build if missing)
 if (-not (Test-Path $Exe)) {
-    Write-Host ">>> 构建 release(首次较慢)..." -ForegroundColor Cyan
+    Write-Host ">>> Building release (first time takes a while)..." -ForegroundColor Cyan
     Push-Location $Repo
     cargo build --release
-    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build --release 失败" }
+    if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build --release failed" }
     Pop-Location
-    if (-not (Test-Path $Exe)) { throw "构建成功但找不到 $Exe" }
+    if (-not (Test-Path $Exe)) { throw "Build finished but $Exe not found" }
 }
 
-# 2) 复制到 ~/.raincode/bin
+# 2) Copy to ~/.raincode/bin
 New-Item -ItemType Directory -Force -Path $Bin | Out-Null
 Copy-Item $Exe (Join-Path $Bin "raincode.exe") -Force
 
-# 3) 加入用户 PATH(幂等)
+# 3) Add to user PATH (idempotent)
 $Current = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($Current -and $Current.Contains($Bin)) {
-    Write-Host "✔ $Bin 已在 PATH 中。" -ForegroundColor Green
+    Write-Host "[ok] $Bin is already on PATH." -ForegroundColor Green
 } else {
     [Environment]::SetEnvironmentVariable("Path", "$Current;$Bin", "User")
-    Write-Host "✔ 已把 $Bin 加入用户 PATH(请新开一个终端生效)。" -ForegroundColor Green
+    Write-Host "[ok] Added $Bin to user PATH. Open a NEW terminal for it to take effect." -ForegroundColor Green
 }
 
 Write-Host ""
-Write-Host "Raincode 安装完成!" -ForegroundColor Green
-Write-Host "  新终端里输入:  raincode repl    (交互式 TUI)"
-Write-Host "               raincode run \"写个 hello world\"   (单次任务)"
-Write-Host "  首次使用请先:  raincode setup   (配置模型 + API key)"
+Write-Host "Raincode installed!" -ForegroundColor Green
+Write-Host "  In a new terminal, from any folder:"
+Write-Host "    raincode repl"                        # interactive TUI
+Write-Host '    raincode run "write a hello world"'   # one-shot task
+Write-Host "  First-time setup:"
+Write-Host "    raincode setup"                       # configure model + API key
