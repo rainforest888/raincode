@@ -66,8 +66,8 @@ fn default_price_source() -> String { "missing".to_string() }
 
 /// One merged output row for the final library (one per target bare-name model).
 /// Capability scores, per-1M pricing and context window come from the research
-/// report when it names them, else from the OpenRouter baseline row, else a
-/// synthesized default.
+/// report when it names them, else from the OpenRouter baseline row. Rows are
+/// never synthesized from fabricated defaults.
 #[derive(Debug, Clone)]
 pub struct EnrichedRow {
     pub model: String,
@@ -153,6 +153,11 @@ pub fn parse_agent_output(raw: &str) -> Result<ResearchReport> {
 pub fn build_research_prompt(targets: &[String], top: usize) -> String {
     format!(
         "You are researching model pricing and benchmark scores for a coding-agent model pool.\n\
+         This is a WEB-ONLY research task. Do NOT read local files; do not read project files; \
+         ignore any local briefs, notes or task lists you may see — they are not part of your job.\n\
+         FIRST, fetch the real, current model list from https://openrouter.ai/api/v1/models with \
+         your web tools, and base BOTH the \"popular\" ids and every \"models\" id on REAL entries \
+         from that list (or other fetched sources). Never invent or guess model ids.\n\
          Anchor sources: LMArena leaderboard (popularity), OpenRouter /api/v1/models (Artificial-Analysis \
          + Design-Arena scores), Artificial Analysis, and the opencode.ai pricing page.\n\
          Steps:\n\
@@ -189,12 +194,13 @@ async fn run_research_agent(
     let skill_dir = crate::skills_dir(config);
     let store = Store::open(crate::state_path())?;
     let skill_store = SkillStore::new(&skill_dir);
-    let cwd = config
-        .core
-        .workspace
-        .as_deref()
-        .map(crate::expand_tilde)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+    // Pin the agent's cwd to a neutral scratch dir, NOT the user's workspace: the
+    // research agent is web-only and must not start inside the repo where local
+    // task briefs / files look like part of its job.
+    let cwd = crate::raincode_home().join("tool_output");
+    if let Err(e) = std::fs::create_dir_all(&cwd) {
+        tracing::warn!("failed to create research cwd {}: {e}", cwd.display());
+    }
 
     let mut tools = default_tools(skill_store.clone());
     tools.retain(|t| t.spec().name != "delegate_research");
@@ -295,10 +301,14 @@ async fn resolve_missing_prices(
             .iter()
             .find(|b| bare_name(&b.model) == bare_name(&row.model))
             .map(|b| b.input_cost_per_m);
+        let fallback_txt = match fallback {
+            Some(f) => format!("{f:.4}"),
+            None => "无基准价".to_string(),
+        };
         let question = format!(
             "模型 {} 的价格没能在网上找到。请你自己搜一下它的每百万 token 输入价格($/M)，\
-             直接输入数字(如 0.5)，或回车用 OpenRouter 基准价({:?})",
-            row.model, fallback
+             直接输入数字(如 0.5)，或回车用 OpenRouter 基准价({})",
+            row.model, fallback_txt
         );
         let answer = hook.ask(&question).await.trim().to_string();
         if let Ok(p) = answer.parse::<f64>() {
@@ -339,7 +349,7 @@ pub async fn enrich_command(config: &FileConfig, args: EnrichArgs) -> Result<()>
     );
 
     // 3) merge + interactive pricing fallback
-    let mut final_rows = build_final_rows(&baseline, &report, &args.add, args.top);
+    let (mut final_rows, skipped) = build_final_rows(&baseline, &report, &args.add, args.top);
     resolve_missing_prices(&mut final_rows, &baseline, !args.dry_run).await?;
 
     // 4) apply (or dry-run) + summary
@@ -350,13 +360,19 @@ pub async fn enrich_command(config: &FileConfig, args: EnrichArgs) -> Result<()>
         println!("[enrich] wrote {} rows", final_rows.len());
     }
     print_summary(&final_rows);
+    if !skipped.is_empty() {
+        println!("skipped: {}", skipped.join(", "));
+    }
     Ok(())
 }
 
 /// 拉取 OpenRouter /api/v1/models 原始 JSON(薄 reqwest 包装,可测部分在
 /// [`baseline_from_json`])。
 async fn fetch_openrouter_raw() -> Result<String> {
-    let resp = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let resp = client
         .get(OPENROUTER_MODELS_URL)
         .send()
         .await?
@@ -380,23 +396,33 @@ async fn fetch_openrouter_baseline() -> Result<Vec<rc_state::CapabilityProfileRo
 /// requested `--add` models, produce the final rows to write. One `EnrichedRow`
 /// per target bare name; for each target prefer the research report's chosen id
 /// (and its pricing/capabilities), else the baseline row for that bare name
-/// (scores kept), else a synthesized default (70s, cost 1.0/3.0, price openrouter).
+/// (scores kept).
+///
+/// Targets with NO research entry AND NO baseline row are SKIPPED (never
+/// synthesized with made-up values) and returned as the second list so the
+/// caller can report `skipped: <names>`.
+///
+/// The `popular` list is capped at `top` slots; `--add` models are appended
+/// after it (deduped) and never truncated by the top limit.
 pub fn build_final_rows(
     baseline: &[CapabilityProfileRow],
     report: &ResearchReport,
     add: &[String],
     top: usize,
-) -> Vec<EnrichedRow> {
+) -> (Vec<EnrichedRow>, Vec<String>) {
     use std::collections::BTreeMap;
-    // Target bare names: report.popular then --add, order preserved, deduped.
+    // Target bare names: popular (capped at `top`) then --add (never truncated),
+    // order preserved, deduped.
     let mut targets: Vec<String> = Vec::new();
-    for bare in report.popular.iter().chain(add.iter()) {
+    for bare in report.popular.iter().take(top) {
         if !targets.contains(bare) {
             targets.push(bare.clone());
         }
     }
-    if targets.len() > top {
-        targets.truncate(top);
+    for bare in add.iter() {
+        if !targets.contains(bare) {
+            targets.push(bare.clone());
+        }
     }
     // baseline row per bare name (last row wins on duplicate versions).
     let by_bare: BTreeMap<String, &CapabilityProfileRow> = baseline
@@ -405,15 +431,21 @@ pub fn build_final_rows(
         .collect();
 
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for bare in targets {
         // Prefer the research report's id for this bare name (its latest-flagged
-        // entry, else the first match); else any baseline row; else synthesize.
+        // entry, else the first match); else any baseline row.
         let researched = report
             .models
             .iter()
             .filter(|m| bare_name(&m.id) == bare)
             .min_by_key(|m| if m.latest == Some(true) { 0 } else { 1 });
         let base = by_bare.get(&bare).copied();
+        if researched.is_none() && base.is_none() {
+            // §6: no research entry and no baseline row → skip, don't fabricate.
+            skipped.push(bare.clone());
+            continue;
+        }
         out.push(EnrichedRow {
             model: researched
                 .map(|m| m.id.clone())
@@ -460,7 +492,7 @@ pub fn build_final_rows(
                 .unwrap_or_else(|| "openrouter".into()),
         });
     }
-    out
+    (out, skipped)
 }
 
 /// Apply enrichment to the store: for each final row, delete every existing DB
@@ -575,7 +607,8 @@ mod tests {
                 context_window: None, price_source: "opencode".into(),
             }],
         };
-        let rows = build_final_rows(&baseline, &report, &[], 15);
+        let (rows, skipped) = build_final_rows(&baseline, &report, &[], 15);
+        assert!(skipped.is_empty());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].input_cost_per_m, 0.05); // agent's opencode price wins
         assert_eq!(rows[0].coding, 69.1);            // baseline score kept
@@ -583,17 +616,52 @@ mod tests {
     }
 
     #[test]
-    fn build_final_rows_synthesizes_default_for_unknown_model() {
+    fn build_final_rows_skips_unknown_model_without_data() {
+        // §6: a target with no research entry AND no baseline row is skipped, not
+        // written with fabricated default values.
         let report = ResearchReport {
             popular: vec!["brand-new-model".into()],
             models: vec![],
         };
-        let rows = build_final_rows(&[], &report, &[], 15);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].model, "brand-new-model");
-        assert_eq!(rows[0].reasoning, 70.0);
-        assert_eq!(rows[0].input_cost_per_m, 1.0);
-        assert_eq!(rows[0].price_source, "openrouter");
+        let (rows, skipped) = build_final_rows(&[], &report, &[], 15);
+        assert!(rows.is_empty());
+        assert_eq!(skipped, vec!["brand-new-model"]);
+    }
+
+    #[test]
+    fn build_final_rows_add_not_truncated_by_top() {
+        // `--add` models must survive the top-N truncation even when the popular
+        // list already fills (or exceeds) `top`.
+        let mk = |model: String| rc_state::CapabilityProfileRow {
+            model, reasoning: 50.0, coding: 50.0, frontend: 50.0, backend: 50.0,
+            math: 50.0, long_context: 50.0, input_cost_per_m: 0.1, output_cost_per_m: 0.2,
+            context_window: 1000, source: "test".into(), updated_at: "now".into(),
+            multimodal: false,
+        };
+        // 20 popular models + one --add model, each with a baseline row.
+        // Version suffix must be digit-only ("-1") for bare_name to strip it.
+        let mut baseline = Vec::new();
+        let mut popular = Vec::new();
+        for i in 0..20 {
+            let bare = format!("model-{i}");
+            baseline.push(mk(format!("provider/{bare}-1")));
+            popular.push(bare);
+        }
+        let add = vec!["must-keep".to_string()];
+        baseline.push(mk("provider/must-keep-1".into()));
+
+        let report = ResearchReport { popular, models: vec![] };
+        let (rows, skipped) = build_final_rows(&baseline, &report, &add, 15);
+        assert!(skipped.is_empty());
+        assert_eq!(
+            rows.len(),
+            16,
+            "popular capped at top=15 + 1 --add must not be truncated away"
+        );
+        assert!(
+            rows.iter().any(|r| bare_name(&r.model) == "must-keep"),
+            "--add model must be present in the result"
+        );
     }
 
     #[tokio::test]
@@ -623,7 +691,7 @@ mod tests {
             }],
         };
         let baseline = store.all_model_profiles().unwrap();
-        let final_rows = build_final_rows(&baseline, &report, &[], 15);
+        let (final_rows, _skipped) = build_final_rows(&baseline, &report, &[], 15);
         assert_eq!(final_rows.len(), 1);
         assert_eq!(final_rows[0].model, "deepseek/deepseek-v4-flash-0731");
         apply_enrichment(&store, &final_rows, false).await.unwrap();
@@ -659,7 +727,7 @@ mod tests {
             models: vec![],
         };
         let baseline = store.all_model_profiles().unwrap();
-        let final_rows = build_final_rows(&baseline, &report, &[], 15);
+        let (final_rows, _skipped) = build_final_rows(&baseline, &report, &[], 15);
         assert_eq!(final_rows.len(), 1);
         assert_eq!(final_rows[0].model, "deepseek/deepseek-v4-flash-0721");
         apply_enrichment(&store, &final_rows, true).await.unwrap();

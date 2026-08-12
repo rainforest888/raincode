@@ -3652,7 +3652,7 @@ mod tests {
         {
           "id": "deepseek/deepseek-chat",
           "context_length": 128000,
-          "pricing": {"prompt": "0.14", "completion": "0.28"}
+          "pricing": {"prompt": "0.00000014", "completion": "0.00000028"}
         },
         {
           "id": "qwen/qwen2.5-coder-32b-instruct",
@@ -3673,8 +3673,9 @@ mod tests {
         let first = &rows[0];
         assert_eq!(first.model, "deepseek/deepseek-chat");
         assert_eq!(first.context_window, 128_000);
-        assert!((first.input_cost_per_m - 140_000.0).abs() < 1e-9);
-        assert!((first.output_cost_per_m - 280_000.0).abs() < 1e-9);
+        // 0.00000014 $/token × 1e6 = $0.14/M.
+        assert!((first.input_cost_per_m - 0.14).abs() < 1e-9);
+        assert!((first.output_cost_per_m - 0.28).abs() < 1e-9);
         assert_eq!(first.source, "openrouter");
         assert_eq!(first.updated_at, "now");
         assert!(!first.multimodal);
