@@ -65,8 +65,14 @@ pub struct Profile {
     pub embedding_model: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    #[serde(default)]
+    // 缺省必须是 {} 而不是 Value::Null:TOML 序列化器不支持 unit,Null 会在
+    // 重存注册表时抛 "unsupported unit type"(profile 缺 extra 表就会命中)。
+    #[serde(default = "default_extra")]
     pub extra: Value,
+}
+
+fn default_extra() -> Value {
+    serde_json::json!({})
 }
 
 fn default_app() -> String {
