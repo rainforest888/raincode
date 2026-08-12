@@ -34,6 +34,10 @@ pub fn frame(width: usize, height: usize) -> String {
         out.push_str(&format!("{TITLE_BLUE}{}{RESET}\r\n", indent(line)));
     }
     out.push_str(&format!("{DIM}  raincode — terminal coding agent{RESET}\r\n"));
+    // 起始引导:直接输入任务,或 /help 看命令与按键(emoji 无关,纯文本)。
+    out.push_str(&format!("{DIM}  直接输入任务开始 · /help 查看命令与按键{RESET}\r\n"));
+    out.push_str(&format!("{DIM}  多模型: /route 拆解复杂任务 · /models 查看模型池{RESET}\r\n"));
+    out.push_str(&format!("{DIM}  配置:   /setup 向导 · /model <id> 切默认模型{RESET}\r\n"));
     let _ = width;
     out
 }

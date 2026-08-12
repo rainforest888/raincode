@@ -586,7 +586,7 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                                     }
                                 }
                                 Err(e) => {
-                                    model.push_line(format!("[error] {e}"), LineStyle::Error);
+                                    push_error(&mut model, &format!("{e}"));
                                 }
                             }
                         }
@@ -611,11 +611,11 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                                         );
                                     }
                                     Err(e) => {
-                                        model.push_line(format!("[error] {e}"), LineStyle::Error);
+                                        push_error(&mut model, &format!("{e}"));
                                     }
                                 },
                                 Err(e) => {
-                                    model.push_line(format!("[error] {e}"), LineStyle::Error);
+                                    push_error(&mut model, &format!("{e}"));
                                 }
                             }
                         }
@@ -666,7 +666,7 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                                         LineStyle::Dim,
                                     );
                                 }
-                                Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                                Err(e) => { push_error(&mut model, &format!("{e}")); },
                             }
                         } else if !execute_cmd(
                             &mut model, &cmd, &mut shell,
@@ -1143,14 +1143,14 @@ async fn do_compact(
     let provider = match env.make_provider(registry) {
         Ok(p) => p,
         Err(e) => {
-            model.push_line(format!("[error] {e}"), LineStyle::Error);
+            push_error(model, &format!("{e}"));
             return Ok(true);
         }
     };
     let store = match env.open_store() {
         Ok(s) => s,
         Err(e) => {
-            model.push_line(format!("[error] {e}"), LineStyle::Error);
+            push_error(model, &format!("{e}"));
             return Ok(true);
         }
     };
@@ -1237,7 +1237,7 @@ async fn execute_cmd(
                             LineStyle::Tool,
                         );
                     }
-                    Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                    Err(e) => { push_error(model, &format!("{e}")); },
                 }
                 return Ok(true);
             }
@@ -1325,12 +1325,12 @@ async fn execute_cmd(
                         model.push_line("✻ 模型选择器:输入过滤 · ↑↓ 选择 · Enter 确定 · Esc 退出".into(), LineStyle::Dim);
                         model.open_model_picker(entries);
                     }
-                    Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                    Err(e) => { push_error(model, &format!("{e}")); },
                 }
             } else {
                 match use_model(env, registry, id) {
                     Ok(lines) => push_lines(model, lines),
-                    Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                    Err(e) => { push_error(model, &format!("{e}")); },
                 }
             }
         }
@@ -1340,7 +1340,7 @@ async fn execute_cmd(
             let store = match env.open_store() {
                 Ok(s) => s,
                 Err(e) => {
-                    model.push_line(format!("[error] {e}"), LineStyle::Error);
+                    push_error(model, &format!("{e}"));
                     return Ok(true);
                 }
             };
@@ -1353,13 +1353,13 @@ async fn execute_cmd(
                         let short: String = id.chars().take(8).collect();
                         model.push_line(format!("[resume] 会话 {short}"), LineStyle::Dim);
                     }
-                    Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                    Err(e) => { push_error(model, &format!("{e}")); },
                 },
                 Ok(None) => model.push_line(
                     format!("[error] 会话 {id} 不存在(见 /resume 选择器)"),
                     LineStyle::Error,
                 ),
-                Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                Err(e) => { push_error(model, &format!("{e}")); },
             }
         }
         Cmd::ListSkills => {
@@ -1383,7 +1383,7 @@ async fn execute_cmd(
             }
             match env.skill_nav(&task) {
                 Ok(lines) => push_lines(model, lines),
-                Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                Err(e) => { push_error(model, &format!("{e}")); },
             }
         }
         Cmd::Setup => {}
@@ -1472,7 +1472,7 @@ async fn execute_cmd(
                         LineStyle::Tool,
                     );
                 }
-                Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+                Err(e) => { push_error(model, &format!("{e}")); },
             }
         }
         Cmd::Risk(None) => {
@@ -1506,7 +1506,7 @@ async fn execute_cmd(
             let provider = match env.make_provider(registry) {
                 Ok(p) => p,
                 Err(e) => {
-                    model.push_line(format!("[error] {e}"), LineStyle::Error);
+                    push_error(model, &format!("{e}"));
                     return Ok(true);
                 }
             };
@@ -1657,7 +1657,7 @@ fn start_session_picker(model: &mut ReplModel, env: &dyn ReplEnv) {
     let store = match env.open_store() {
         Ok(s) => s,
         Err(e) => {
-            model.push_line(format!("[error] {e}"), LineStyle::Error);
+            push_error(model, &format!("{e}"));
             return;
         }
     };
@@ -1672,7 +1672,7 @@ fn start_session_picker(model: &mut ReplModel, env: &dyn ReplEnv) {
             );
             model.open_session_picker(entries);
         }
-        Err(e) => model.push_line(format!("[error] {e}"), LineStyle::Error),
+        Err(e) => { push_error(model, &format!("{e}")); },
     }
 }
 
@@ -2032,6 +2032,39 @@ fn wizard_parse_model(entry: &rc_profile::ProviderCatalogEntry, answer: &str) ->
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+/// 针对错误内容给出可操作提示(与 rc-cli 的 print_error_hint 对齐的紧凑版)。
+pub(crate) fn error_hint(msg: &str) -> Option<&'static str> {
+    let s = msg.to_lowercase();
+    if s.contains("503") || s.contains("429") || s.contains("500") || s.contains("502")
+        || s.contains("504") || s.contains("provider error") || s.contains("transport error")
+    {
+        Some("模型端点暂时不可用。稍后重试,或 /model 换一个模型。")
+    } else if s.contains("no provider profiles") || s.contains("model configured")
+        || s.contains("model add") || s.contains("profiles configured")
+    {
+        Some("还没有配置模型。运行 /setup 交互式配置。")
+    } else if s.contains("api key") || s.contains("401") || s.contains("403") || s.contains("auth")
+    {
+        Some("API key 缺失或无效。运行 /setup 重新配置 key。")
+    } else if s.contains("compile") || s.contains("cargo check") || s.contains("error[")
+    {
+        Some("编译/检查失败,看上面 cargo 输出。")
+    } else if s.contains("connect") || s.contains("network") || s.contains("timed out")
+    {
+        Some("网络连接问题。外网可走 Clash 代理(127.0.0.1:7890)。")
+    } else {
+        None
+    }
+}
+
+/// 推错误行 + 可选可操作 hint(I2)。
+fn push_error(model: &mut ReplModel, msg: &str) {
+    model.push_line(format!("[error] {msg}"), LineStyle::Error);
+    if let Some(h) = error_hint(msg) {
+        model.push_line(format!("[hint] {h}"), LineStyle::Dim);
     }
 }
 
