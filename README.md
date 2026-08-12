@@ -1,8 +1,6 @@
 # Raincode
 
-**模型层 harness 优化器(Rust 实现)——不替代你的人用 agent,而是优化它背后的模型层:低价模型池、能力路由、prompt 缓存、provider 可靠性、自我迭代。**
-
-> 定位说明:raincode 早期目标是"像 Claude Code 一样在终端干活"的人用 agent。实践证明人用 UX 上赢不过成熟产品,那也不是它的差异化所在。它真正擅长的是**当 harness**:程序化/AI 驱动地调用模型、管理模型池、优化缓存与成本、并自我迭代改进这些核心。于是把它重新定位为"优化现有 harness 的模型层工具"。
+**模型层 harness 优化器(Rust 实现):低价模型池、能力路由、prompt 缓存、provider 可靠性、自我迭代,为你的 AI harness 提供高效可靠的模型层。**
 
 ---
 
@@ -45,12 +43,6 @@ raincode 就是针对这些的**模型层优化器**——它不抢你主 agent 
 
 ### 6. MCP 客户端
 - stdio / HTTP / SSE MCP 服务器,工具以 `mcp__<server>_<tool>` 命名暴露。
-
-## 它不是什么
-
-- **不是给你人用的成熟 agent**:TUI / 错误提示 / 文档面向 AI 与脚本驱动,人直接上手会难受。
-- **不是生态**:无 IDE 插件,社区小。
-- 要人用体验,用 Claude Code / opencode —— raincode 做的是它们**背后的模型层**。
 
 ## 快速开始
 
