@@ -1904,10 +1904,12 @@ async fn save_wizard_profile(
 ) -> Result<()> {
     let entry = setup.entry.as_ref().ok_or_else(|| anyhow!("wizard: no provider"))?;
     let model_id = setup.model.as_deref().unwrap_or(entry.default_model);
-    let id = entry.id.to_string();
+    // id 必须带模型:同供应商多个模型各自独立,不覆盖;也避免与同名模型的
+    // 其他供应商混淆(如 opencode-go 的 deepseek-v4-flash ≠ DeepSeek 官方的)。
+    let id = format!("{}-{}", entry.id, model_id);
     let mut profile = rc_profile::model::Profile {
         id: id.clone(),
-        name: format!("{} ({})", entry.display_name, id),
+        name: format!("{} / {}", entry.display_name, model_id),
         app: "raincode".into(),
         kind: entry.kind,
         base_url: setup
