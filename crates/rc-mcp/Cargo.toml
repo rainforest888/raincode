@@ -15,3 +15,11 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rc-tool = { workspace = true }
+
+# 单元测试用的 stdio mock MCP 服务器(纯 Rust,不依赖 node)。
+# 测试通过 env!("CARGO_BIN_EXE_mcp_mock") 找到它的可执行文件。
+# test 默认 true:cargo test 时编译该 bin 并注入 CARGO_BIN_EXE_mcp_mock,
+# 之前显式 test=false 导致 env! 编译期未定义。
+[[bin]]
+name = "mcp_mock"
+path = "src/bin/mcp_mock.rs"

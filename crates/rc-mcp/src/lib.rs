@@ -63,10 +63,12 @@ pub enum McpError {
     Tool(String),
 }
 
+#[derive(Debug)]
 pub struct McpClient {
     inner: McpInner,
 }
 
+#[derive(Debug)]
 enum McpInner {
     // StdioClient 含 Child/BufReader(480B),box 以缩小 McpInner 枚举尺寸。
     Stdio(Box<Mutex<StdioClient>>),
@@ -74,6 +76,7 @@ enum McpInner {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 struct StdioClient {
     child: Child,
     stdin: ChildStdin,
@@ -81,6 +84,7 @@ struct StdioClient {
     next_id: u64,
 }
 
+#[derive(Debug)]
 struct HttpClient {
     url: String,
     headers: BTreeMap<String, String>,
@@ -109,6 +113,11 @@ impl McpClient {
                 }),
             )
             .await?;
+            // 2024-11-05 规范:initialize 完成后客户端应发送 notifications/initialized。
+            // 部分严格服务器在收到它之前会拒绝后续请求;通知尽力而为,失败不阻断连接。
+            if let Err(e) = http.notify("notifications/initialized", json!({})).await {
+                tracing::warn!("MCP HTTP server rejected notifications/initialized: {e}");
+            }
             Ok(Self {
                 inner: McpInner::Http(http),
             })
@@ -289,35 +298,53 @@ impl HttpClient {
             .cloned()
             .ok_or_else(|| McpError::Rpc(format!("response for {method} has no result")))
     }
+
+    /// 发送 JSON-RPC 通知(无 id,服务器不回复 result)。返回 HTTP 层错误,
+    /// 非 2xx 状态视为失败(调用方决定是否致命)。
+    async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
+        let request = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let mut builder = self.client.post(&self.url).json(&request);
+        for (key, value) in &self.headers {
+            builder = builder.header(key, value);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(McpError::HttpStatus {
+                status: status.as_u16(),
+                body: String::new(),
+            });
+        }
+        Ok(())
+    }
 }
 
 fn parse_sse_response(body: &str, method: &str) -> Result<Value, McpError> {
+    // SSE 规范:一个事件的多个 data: 行用换行连接(JSON 通常单行)。
     let mut data = Vec::new();
+    let mut events = Vec::new();
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix("data:") {
             data.push(rest.trim().to_string());
         } else if line.trim().is_empty() && !data.is_empty() {
-            let text = data.join("");
+            let text = data.join("\n");
             data.clear();
             if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if let Some(error) = value.get("error") {
-                    return Err(McpError::Rpc(error.to_string()));
-                }
-                if let Some(result) = value.get("result") {
-                    return Ok(result.clone());
-                }
+                events.push(value);
             }
         }
     }
     if !data.is_empty() {
-        let text = data.join("");
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            if let Some(error) = value.get("error") {
-                return Err(McpError::Rpc(error.to_string()));
-            }
-            if let Some(result) = value.get("result") {
-                return Ok(result.clone());
-            }
+        if let Ok(value) = serde_json::from_str::<Value>(&data.join("\n")) {
+            events.push(value);
+        }
+    }
+    for event in events {
+        if let Some(error) = event.get("error") {
+            return Err(McpError::Rpc(error.to_string()));
+        }
+        if let Some(result) = event.get("result") {
+            return Ok(result.clone());
         }
     }
     Err(McpError::Rpc(format!(
@@ -371,6 +398,8 @@ impl McpManager {
                 };
                 tools.push(McpTool {
                     client: client.clone(),
+                    server: name.clone(),
+                    tool_name: spec.name.clone(),
                     spec: namespaced,
                 });
             }
@@ -385,7 +414,26 @@ impl McpManager {
 
 pub struct McpTool {
     client: Arc<McpClient>,
+    server: String,
+    tool_name: String,
     spec: McpToolSpec,
+}
+
+impl McpTool {
+    /// MCP 服务器名(配置键,如 `github`)。
+    pub fn server_name(&self) -> &str {
+        &self.server
+    }
+
+    /// 服务器暴露的原始工具名(如 `search_repos`),未加 `mcp__` 前缀。
+    pub fn tool_name(&self) -> &str {
+        &self.tool_name
+    }
+
+    /// 直接调用本工具(绕过 Tool trait 的命名空间映射),集成测试用。
+    pub async fn call(&self, name: &str, args: Value) -> Result<Value, McpError> {
+        self.client.call(name, args).await
+    }
 }
 
 #[async_trait]
@@ -399,14 +447,7 @@ impl Tool for McpTool {
     }
 
     async fn run(&self, args: Value, _ctx: &ToolContext) -> ToolResult {
-        let raw_name = self
-            .spec
-            .name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once('_'))
-            .map(|(_, name)| name.to_string())
-            .unwrap_or_else(|| self.spec.name.clone());
-        match self.client.call(&raw_name, args).await {
+        match self.client.call(&self.tool_name, args).await {
             Ok(Value::String(text)) => ToolResult::ok(text),
             Ok(value) => ToolResult::ok(value.to_string()),
             Err(e) => ToolResult::err(e.to_string()),
@@ -451,86 +492,11 @@ fn text_from_content(content: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
-    // Shared node-based mock MCP server for stdio integration tests.
-    const MOCK_MCP_SCRIPT: &str = r#"
-const readline = require("node:readline");
-const rl = readline.createInterface({ input: process.stdin });
-rl.on("line", (line) => {
-  const req = JSON.parse(line);
-  if (!req.id) return;
-  let result;
-  if (req.method === "initialize") {
-    result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "mock-mcp", version: "1.0" } };
-  } else if (req.method === "tools/list") {
-    result = { tools: [{ name: "echo", description: "echo input", inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }] };
-  } else if (req.method === "tools/call") {
-    result = { content: [{ type: "text", text: "echo:" + req.params.arguments.text }] };
-  } else {
-    result = {};
-  }
-  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: req.id, result }) + "\n");
-});
-"#;
-
-    fn mock_stdio_config() -> McpServerConfig {
-        McpServerConfig {
-            kind: "stdio".into(),
-            command: Some("node".into()),
-            args: vec!["-e".into(), MOCK_MCP_SCRIPT.into()],
-            url: None,
-            headers: Default::default(),
-            env: Default::default(),
-        }
-    }
-
     #[test]
     fn mcp_namespace_is_double_underscore() {
-        // 命名规则:name = mcp__<server>_<tool>。
-        let name = "mcp__github_search_repos";
-        assert_eq!(name, "mcp__github_search_repos");
-        // run 提取:strip_prefix("mcp__") + split_once('_') → 第一个下划线之后是 raw tool name。
-        let (_, raw) = name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once('_'))
-            .unwrap();
-        assert_eq!(raw, "search_repos");
-    }
-
-    #[test]
-    fn raw_name_preserves_underscores_in_tool_name() {
-        // 回归:工具名本身含下划线时,rsplit_once('_') 会误取最后一个下划线之后的部分。
-        let name = "mcp__github_search_repositories";
-        let raw = name
-            .strip_prefix("mcp__")
-            .and_then(|rest| rest.split_once('_'))
-            .map(|(_, name)| name.to_string())
-            .unwrap_or_else(|| name.to_string());
-        assert_eq!(raw, "search_repositories");
-    }
-
-    #[tokio::test]
-    async fn connect_all_skips_slow_server_instead_of_aborting_all() {
-        // 一个服务器 connect 失败(指向关闭端口的 HTTP),另一个成功(node mock)。
-        // 断言:坏服务器被跳过并记入 failed,好服务器的工具正常暴露。
-        let mut configs: BTreeMap<String, McpServerConfig> = BTreeMap::new();
-        configs.insert("good".into(), mock_stdio_config());
-        configs.insert(
-            "bad".into(),
-            McpServerConfig {
-                kind: "http".into(),
-                command: None,
-                args: vec![],
-                url: Some("http://127.0.0.1:1".into()),
-                headers: Default::default(),
-                env: Default::default(),
-            },
-        );
-
-        let manager = McpManager::connect_all(&configs).await.unwrap();
-        assert_eq!(manager.failed, vec!["bad".to_string()]);
-        assert_eq!(manager.servers, vec!["good".to_string()]);
-        assert_eq!(manager.tools.len(), 1);
-        assert_eq!(manager.tools[0].spec().name, "mcp__good_echo");
+        // 命名规则:name = mcp__<server>_<tool>,与 rc-core 暴露给模型的名字一致。
+        let namespaced = format!("mcp__{}_{}", "github", "search_repos");
+        assert_eq!(namespaced, "mcp__github_search_repos");
     }
 
     #[test]
@@ -555,15 +521,11 @@ rl.on("line", (line) => {
         assert!(parse_sse_response(body, "tools/list").is_err());
     }
 
-    #[tokio::test]
-    async fn stdio_mcp_client_lists_and_calls_tools() {
-        let config = mock_stdio_config();
-        let client = McpClient::connect(config).await.unwrap();
-        let tools = client.tools().await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "echo");
-        assert_eq!(tools[0].description, "echo input");
-        let result = client.call("echo", json!({"text": "hello"})).await.unwrap();
-        assert_eq!(result, json!("echo:hello"));
+    #[test]
+    fn parses_sse_response_joins_multiline_data_with_newline() {
+        // SSE 规范:同一事件的多行 data: 用换行连接;JSON 在 token 之间换行仍合法。
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\ndata: {\"ok\":true}}\n\n";
+        let value = parse_sse_response(body, "tools/list").unwrap();
+        assert_eq!(value["ok"], json!(true));
     }
 }
