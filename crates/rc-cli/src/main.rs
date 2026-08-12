@@ -797,6 +797,19 @@ fn make_provider(registry: &Registry) -> Result<Arc<dyn Provider>> {
     provider_for_profile(registry, None)
 }
 
+/// 运行 `cargo check` 验证工作区可编译(route 事后门禁用)。返回是否成功;
+/// 找不到 cargo 等环境问题返回 Err。`--quiet` 抑制进度,编译错误仍打到 stderr。
+fn cargo_check_ok() -> Result<bool, String> {
+    use std::process::Command;
+    let start = std::time::Instant::now();
+    let out = Command::new("cargo")
+        .args(["check", "--quiet"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    tracing::info!("cargo check {:?} in {:?}", out.status.code(), start.elapsed());
+    Ok(out.status.success())
+}
+
 fn provider_for_profile(registry: &Registry, id: Option<&str>) -> Result<Arc<dyn Provider>> {
     let profile = match id {
         Some(id) => registry
@@ -2623,6 +2636,17 @@ async fn route_command(
         cancel.cloned(),
     )
     .await;
+    // 4.4) 事后编译门禁:工作区是 Rust 时快速 cargo check,编译失败说明有子任务
+    //     产出未编译通过(即使该子任务自报 ok)。警告进日志/输出,供观察与复查。
+    if Path::new("Cargo.toml").exists() && !results.is_empty() {
+        match cargo_check_ok() {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "[route] 警告:子任务执行后工作区 cargo check 失败 —— 可能有子任务产出未编译通过"
+            ),
+            Err(e) => tracing::warn!("post-route cargo check 跳过: {e}"),
+        }
+    }
     // 4.5) 终局:取消发 cancelled(已中断),否则发 Done 复位 TUI phase。
     //     OrchestratorResult 已由 execute_subtasks_batched 逐子任务回灌。
     if let Some(emit) = &emit {
@@ -2948,7 +2972,12 @@ fn collect_executable(
                 .collect();
             jobs.push((
                 plan.subtask.id.clone(),
-                plan.subtask.description.clone(),
+                format!(
+                    "{}\n\n[验收要求] 若你修改了任何 .rs 源码文件,必须在结束前运行 \
+                     `cargo check -p <受影响的 crate>`(或 `cargo test -p <crate>`)确认编译/测试通过; \
+                     编译失败或测试失败不算完成,需继续修复直到通过。若确实无法通过,明确报告任务失败,不要谎报完成。",
+                    plan.subtask.description
+                ),
                 depends_on,
                 AgentConfig {
                     provider,
