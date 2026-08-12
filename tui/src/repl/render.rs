@@ -245,19 +245,19 @@ fn render_live(model: &ReplModel, width: usize, now: Instant) -> Vec<String> {
     }
     // 思考完成:可折叠行(Enter 展开)。完整链存在 reasoning_chain 时显示。
     else if let Some(chain) = &model.reasoning_chain {
-        let first = chain.lines().next().unwrap_or("").trim();
-        let line = if model.reasoning_expanded {
-            chain
-        } else {
-            &format!("↳ 推理: {first}")
-        };
-        out.push(paint(
-            &truncate_line(line, width),
-            LineStyle::Dim,
-        ));
         if model.reasoning_expanded {
+            // 展开:完整思维链逐行显示(不截断成一行),否则长链只露第一屏。
+            for line in chain.lines() {
+                out.push(paint(&truncate_line(line, width), LineStyle::Dim));
+            }
             out.push(paint(
-                &truncate_line("(Ctrl+O 收起 / 按 Enter 收起)", width),
+                &truncate_line("(Ctrl+O 收起)", width),
+                LineStyle::Dim,
+            ));
+        } else {
+            let first = chain.lines().next().unwrap_or("").trim();
+            out.push(paint(
+                &truncate_line(&format!("↳ 推理: {first}"), width),
                 LineStyle::Dim,
             ));
         }

@@ -2935,7 +2935,10 @@ fn collect_executable(
                     network_policy: network_policy(config),
                     cwd: workspace.clone(),
                     state_path: state_path(),
-                    max_turns: config.core.max_turns.unwrap_or(24),
+                    // 子代理按上下文限制而非步数上限:给足轮次(至少 48),让它能
+                    // 先探索再实现,完成任务自然停(模型不再调工具即结束)。用户
+                    // 配置的 max_turns 只作为下限,不再成为复杂子任务的硬卡点。
+                    max_turns: config.core.max_turns.unwrap_or(24).max(48),
                     max_steps: 0,
                     evolve_on_finish: config.evolve.enabled.unwrap_or(true),
                     plan_mode: false,

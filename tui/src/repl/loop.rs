@@ -468,6 +468,14 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                         // 流已结束:与 agent 事件 flush 一致,把流式期间延迟的
                         // 审批/提问/工具结果按 FIFO apply,避免留到下次 agent 事件。
                         model.flush_interrupts();
+                        // 持久化 chat 回复(与用户消息对应),resume 后可回看。
+                        if let Ok(store) = env.open_store() {
+                            let _ = store.append_message(
+                                &model.session_id,
+                                rc_state::MessageRole::Assistant,
+                                &reply,
+                            );
+                        }
                         chat_history.push(rc_pro::canonical::CanonicalMessage::assistant_text(reply));
                         chat_handle = None;
                     }
@@ -1481,6 +1489,14 @@ async fn execute_cmd(
                 }
             };
             model.push_line(format!("❯ {text}"), LineStyle::Accent);
+            // 持久化 chat 用户消息:否则 /resume 或重开会话后对话记录就丢了(被"隐藏")。
+            if let Ok(store) = env.open_store() {
+                let _ = store.append_message(
+                    &model.session_id,
+                    rc_state::MessageRole::User,
+                    &text,
+                );
+            }
             model.done_at = None;
             chat_history.push(rc_pro::canonical::CanonicalMessage::user(text.clone()));
             let history = chat_history.clone();
