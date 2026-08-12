@@ -646,11 +646,14 @@ impl AgentInner {
                 spec.name, spec.description, spec.input_schema
             ));
         }
+        // 规则文件优先级(opencode docs/rules):AGENTS.md 存在时只用它,
+        // CLAUDE.md 仅在无 AGENTS.md 时作为 Claude Code 兼容回退,避免两份规则冲突。
         for file in ["AGENTS.md", "CLAUDE.md"] {
             let path = self.cwd.join(file);
             if let Ok(text) = std::fs::read_to_string(&path) {
                 prompt.push_str(&format!("\nWorkspace {file}:\n"));
                 prompt.push_str(&text);
+                break;
             }
         }
         if self.plan_mode {
@@ -701,11 +704,13 @@ impl AgentInner {
                 spec.name, spec.description, spec.input_schema
             ));
         }
+        // 与 build_system_prompt 一致:AGENTS.md 优先,CLAUDE.md 仅作回退。
         for file in ["AGENTS.md", "CLAUDE.md"] {
             let path = self.cwd.join(file);
             if let Ok(text) = std::fs::read_to_string(&path) {
                 prompt.push_str(&format!("\nWorkspace {file}:\n"));
                 prompt.push_str(&text);
+                break;
             }
         }
         prompt.push_str(
