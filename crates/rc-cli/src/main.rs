@@ -298,6 +298,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 交互式配置向导:选 provider → 填 API key → 测试连接 → 设默认模型。
+    Setup,
     /// Run one prompt to completion and print events.
     Run {
         prompt: String,
@@ -620,6 +622,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         return serve_stdio(&config).await;
     }
     match cli.command {
+        Some(Command::Setup) => setup_command(&config).await,
         Some(Command::Run {
             prompt,
             resume,
@@ -2016,6 +2019,219 @@ async fn skills_command(config: &FileConfig, cmd: SkillsCmd) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// 交互式读取一行输入(带提示,不回显限制;key 走单独流程)。
+fn prompt_line(prompt: &str) -> String {
+    print!("{prompt}");
+    io::stdout().flush().ok();
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
+/// `raincode setup` 交互式配置向导:添加模型 → 填 key → 验证 → 设默认。
+async fn setup_command(_config: &FileConfig) -> Result<()> {
+    let mut registry = load_registry()?;
+    println!("== Raincode 配置向导 ==");
+    loop {
+        if registry.profiles.is_empty() {
+            println!("当前还没有配置任何模型。先添加一个 provider。");
+        } else {
+            println!("\n已配置模型池:");
+            for (i, p) in registry.profiles.iter().enumerate() {
+                let active = registry.active_id.as_deref() == Some(p.id.as_str());
+                let mark = if active { "*" } else { " " };
+                println!("  {}. {}{}  {}  {}", i + 1, mark, p.id, p.model, p.base_url);
+            }
+            println!("(* 为默认模型)");
+        }
+        let menu = if registry.profiles.is_empty() {
+            "1. 添加模型   q. 退出"
+        } else {
+            "1. 添加模型  2. 设为默认  3. 测试连接  4. 移除   q. 退出"
+        };
+        println!("\n{menu}");
+        let choice = prompt_line("> ").trim().to_lowercase();
+        match choice.as_str() {
+            "1" => add_provider_wizard(&mut registry).await?,
+            "2" if !registry.profiles.is_empty() => set_active_wizard(&registry)?,
+            "3" if !registry.profiles.is_empty() => test_connection_wizard(&registry).await?,
+            "4" if !registry.profiles.is_empty() => remove_profile_wizard(&mut registry)?,
+            "q" | "" => {
+                println!("\n配置完成。开始干活:");
+                println!("  raincode run \"写个函数并测试\"     单次任务");
+                println!("  raincode route \"复杂任务\"          多模型拆解执行");
+                println!("  raincode profiles enrich          自动拉真实定价/评分刷新模型池");
+                break;
+            }
+            _ => println!("无效选择,重试。"),
+        }
+    }
+    Ok(())
+}
+
+/// 添加 provider:从 catalog 选供应商 → 模型 → API key → 验证 → 保存并设默认。
+async fn add_provider_wizard(registry: &mut Registry) -> Result<()> {
+    let entries = rc_profile::catalog::catalog();
+    println!("\n选择供应商:");
+    for (i, e) in entries.iter().enumerate() {
+        println!(
+            "  {}. {}  (默认模型 {})",
+            i + 1,
+            e.display_name,
+            e.default_model
+        );
+    }
+    let choice = prompt_line("编号 (q=取消): ").trim().to_string();
+    if choice.eq_ignore_ascii_case("q") || choice.is_empty() {
+        return Ok(());
+    }
+    let idx: usize = match choice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= entries.len() => n - 1,
+        _ => {
+            println!("无效编号。");
+            return Ok(());
+        }
+    };
+    let entry = &entries[idx];
+    // id 冲突时加序号(如 openai-2)。
+    let mut id = entry.id.to_string();
+    if registry.get(&id).is_some() {
+        let mut n = 2;
+        while registry.get(&format!("{id}-{n}")).is_some() {
+            n += 1;
+        }
+        id = format!("{id}-{n}");
+    }
+    let model = prompt_line(&format!("模型名 (回车用默认 {}): ", entry.default_model))
+        .trim()
+        .to_string();
+    let model = if model.is_empty() {
+        entry.default_model.to_string()
+    } else {
+        model
+    };
+    let key = prompt_line("API key (粘贴后回车;留空则用环境变量): ").trim().to_string();
+    if key.is_empty() {
+        println!(
+            "未填 key,将尝试环境变量 {}。",
+            entry.env_var.unwrap_or("<无>")
+        );
+    }
+
+    let mut profile = Profile {
+        id: id.clone(),
+        name: format!("{} ({})", entry.display_name, id),
+        app: "raincode".into(),
+        kind: entry.kind,
+        base_url: entry.base_url.to_string(),
+        model: model.clone(),
+        api_key: None,
+        api_key_env: entry.env_var.map(|e| e.to_string()),
+        api_key_file: None,
+        embedding_model: entry.embedding_model.map(|e| e.to_string()),
+        headers: Default::default(),
+        extra: serde_json::json!({}),
+    };
+    // 连通性验证(非本地 + 有 key):通过才落盘。
+    let is_local = matches!(entry.kind, ProfileKind::Ollama)
+        || entry.base_url.contains("localhost")
+        || entry.base_url.contains("127.0.0.1");
+    if !is_local && !key.is_empty() {
+        let mut probe = profile.clone();
+        probe.api_key = Some(key.clone());
+        match verify_provider_connectivity(&probe).await {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("[verify] 连接失败: {e}");
+                let cont = prompt_line("[verify] 若确定 key 无误仍要保存,输入 y: ").trim().to_lowercase();
+                if cont != "y" {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    if !key.is_empty() {
+        store_key(&id, &key)?;
+        profile.api_key = None;
+        profile.api_key_file = Some(key_ref(&id));
+    }
+    registry.add(profile);
+    registry.set_active(&id)?;
+    save_registry(registry)?;
+    println!("已添加并设为默认: {id} ({model})");
+    Ok(())
+}
+
+/// 从已配置 profile 里选一个设为默认。
+fn set_active_wizard(registry: &Registry) -> Result<()> {
+    println!("\n选择要设为默认的模型:");
+    for (i, p) in registry.profiles.iter().enumerate() {
+        let active = registry.active_id.as_deref() == Some(p.id.as_str());
+        println!("  {}. {}{}  {}", i + 1, if active { "*" } else { " " }, p.id, p.model);
+    }
+    let choice = prompt_line("编号 (q=取消): ").trim().to_string();
+    if choice.eq_ignore_ascii_case("q") || choice.is_empty() {
+        return Ok(());
+    }
+    match choice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= registry.profiles.len() => {
+            let id = registry.profiles[n - 1].id.clone();
+            let mut r = load_registry()?;
+            r.set_active(&id)?;
+            save_registry(&r)?;
+            println!("默认模型已设为: {id}");
+        }
+        _ => println!("无效编号。"),
+    }
+    Ok(())
+}
+
+/// 选一个 profile 测试连通性。
+async fn test_connection_wizard(registry: &Registry) -> Result<()> {
+    println!("\n选择要测试的模型:");
+    for (i, p) in registry.profiles.iter().enumerate() {
+        println!("  {}. {}  {}", i + 1, p.id, p.model);
+    }
+    let choice = prompt_line("编号 (q=取消): ").trim().to_string();
+    if choice.eq_ignore_ascii_case("q") || choice.is_empty() {
+        return Ok(());
+    }
+    match choice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= registry.profiles.len() => {
+            let profile = registry.profiles[n - 1].clone();
+            match verify_provider_connectivity(&profile).await {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => eprintln!("[verify] 连接失败: {e}"),
+            }
+        }
+        _ => println!("无效编号。"),
+    }
+    Ok(())
+}
+
+/// 移除一个 profile(含 key)。
+fn remove_profile_wizard(registry: &mut Registry) -> Result<()> {
+    println!("\n选择要移除的模型:");
+    for (i, p) in registry.profiles.iter().enumerate() {
+        println!("  {}. {}  {}", i + 1, p.id, p.model);
+    }
+    let choice = prompt_line("编号 (q=取消): ").trim().to_string();
+    if choice.eq_ignore_ascii_case("q") || choice.is_empty() {
+        return Ok(());
+    }
+    match choice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= registry.profiles.len() => {
+            let id = registry.profiles[n - 1].id.clone();
+            registry.remove(&id);
+            delete_key(&id)?;
+            save_registry(registry)?;
+            println!("已移除: {id}");
+        }
+        _ => println!("无效编号。"),
     }
     Ok(())
 }
