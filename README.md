@@ -79,12 +79,15 @@ raincode setup     # 交互式向导:选 provider → 填 API key
 ```
 API key 只存在 `~/.raincode/keys/`,**绝不进项目文件夹 / 不上传 GitHub**。也支持环境变量:`DEEPSEEK_API_KEY=xxx` 等。
 
-配置文件在 `~/.raincode/config.toml`(默认即可用;高级项见 [config/raincode.example.toml](config/raincode.example.toml)):
+配置文件在 `~/.raincode/config.toml`(不创建也可用默认值):
 
 ```toml
 [core]
 max_turns = 8          # 单任务最大轮数
 approval_mode = "auto" # ask | auto | deny
+
+[model]
+profile = "deepseek-v4-flash"   # 与 ~/.raincode/profiles.toml 里的 profile id 对应
 
 [evolve]
 enabled = false        # 打开后启用 darwinian skill 演化
