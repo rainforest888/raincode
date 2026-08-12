@@ -592,6 +592,12 @@ impl Store {
         Ok(())
     }
 
+    /// 按主键删除一个模型能力画像行(profiles enrich 合并后删除旧版本用)。
+    pub fn delete_model_profile(&self, model: &str) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM model_profiles WHERE model = ?1", [model])?;
+        Ok(())
+    }
+
     pub fn get_model_profile(&self, model: &str) -> Result<Option<CapabilityProfileRow>, DbError> {
         self.conn
             .query_row(
@@ -903,6 +909,23 @@ mod tests {
         store.upsert_model_profile(&p2).unwrap();
         assert!((store.get_model_profile("deepseek-v4").unwrap().unwrap().coding - 93.0).abs() < 1e-6);
         assert_eq!(store.all_model_profiles().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_model_profile_removes_row() {
+        let store = Store::open_in_memory().unwrap();
+        // CapabilityProfileRow 无 Default,按 roundtrip 测试构造全字段
+        let p = CapabilityProfileRow {
+            model: "qwen/qwen3.8-max".into(),
+            reasoning: 80.0, coding: 80.0, frontend: 80.0, backend: 80.0,
+            math: 80.0, long_context: 80.0, input_cost_per_m: 1.0, output_cost_per_m: 2.0,
+            context_window: 128_000, source: "s".into(), updated_at: "t".into(),
+            multimodal: false,
+        };
+        store.upsert_model_profile(&p).unwrap();
+        assert!(store.get_model_profile("qwen/qwen3.8-max").unwrap().is_some());
+        store.delete_model_profile("qwen/qwen3.8-max").unwrap();
+        assert!(store.get_model_profile("qwen/qwen3.8-max").unwrap().is_none());
     }
 
     #[test]
