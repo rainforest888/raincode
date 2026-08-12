@@ -2244,8 +2244,8 @@ fn parse_openrouter_models(raw: &str) -> Result<Vec<rc_state::CapabilityProfileR
     Ok(w.data
         .into_iter()
         .map(|m| {
-            let inp = m.pricing.prompt.parse::<f64>().unwrap_or(0.0);
-            let outp = m.pricing.completion.parse::<f64>().unwrap_or(0.0);
+            let inp = m.pricing.prompt.parse::<f64>().unwrap_or(0.0) * 1_000_000.0;
+            let outp = m.pricing.completion.parse::<f64>().unwrap_or(0.0) * 1_000_000.0;
             // context_length 缺省/为 0 时用默认窗口兜底,不让刷新整体失败。
             let context = if m.context_length == 0 { 128_000 } else { m.context_length as u32 };
             // 真实榜单分(非编造):artificial_analysis 指数直接是 0-100;design_arena
@@ -3642,8 +3642,8 @@ mod tests {
         let first = &rows[0];
         assert_eq!(first.model, "deepseek/deepseek-chat");
         assert_eq!(first.context_window, 128_000);
-        assert!((first.input_cost_per_m - 0.14).abs() < 1e-9);
-        assert!((first.output_cost_per_m - 0.28).abs() < 1e-9);
+        assert!((first.input_cost_per_m - 140_000.0).abs() < 1e-9);
+        assert!((first.output_cost_per_m - 280_000.0).abs() < 1e-9);
         assert_eq!(first.source, "openrouter");
         assert_eq!(first.updated_at, "now");
         assert!(!first.multimodal);
@@ -3656,6 +3656,18 @@ mod tests {
         assert_eq!(third.context_window, 131_072);
         assert!((third.input_cost_per_m - 0.0001).abs() < 1e-9);
         assert!((third.output_cost_per_m - 0.0001).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_openrouter_models_scales_per_token_to_per_million() {
+        // OpenRouter pricing is $/token; the DB stores $/1M tokens. deepseek 0.00000008/token
+        // = $0.08/M, output 0.00000018/token = $0.18/M.
+        let raw = r#"{"data":[{"id":"deepseek/deepseek-v4-flash-0731","context_length":1048576,
+            "pricing":{"prompt":"0.00000008","completion":"0.00000018"},
+            "benchmarks":{},"description":"x"}]}"#;
+        let rows = parse_openrouter_models(raw).unwrap();
+        assert_eq!(rows[0].input_cost_per_m, 0.08);
+        assert_eq!(rows[0].output_cost_per_m, 0.18);
     }
 
     #[test]
