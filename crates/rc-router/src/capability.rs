@@ -100,7 +100,16 @@ pub fn capability_band(pressure: CostPressure) -> f64 {
 
 /// 确定性派活:每个子任务 → **能力优先**排序(能力差 > 带 → 高能力胜;带内 → 便宜胜),
 /// 能力低于 FIT_THRESHOLD → 升级给最强模型。
-pub fn dispatch(subtasks: &[Subtask], profiles: &[CapabilityProfile], fit_threshold: f64, gamma_override: Option<f64>) -> Vec<DispatchEntry> {
+///
+/// `band_bias` 放大能力容差带(>1 更愿用便宜模型,<1 更能力优先)。默认 1.0 保持
+/// `capability_band` 原语义;路由层经配置 `[core] cost_bias` 传入以校准成本偏好。
+pub fn dispatch(
+    subtasks: &[Subtask],
+    profiles: &[CapabilityProfile],
+    fit_threshold: f64,
+    gamma_override: Option<f64>,
+    band_bias: f64,
+) -> Vec<DispatchEntry> {
     if profiles.is_empty() { return Vec::new(); }
     let cheapest = profiles.iter()
         .map(|p| p.input_cost_per_m).fold(f64::INFINITY, f64::min);
@@ -130,7 +139,7 @@ pub fn dispatch(subtasks: &[Subtask], profiles: &[CapabilityProfile], fit_thresh
         // 比性价比(效率高/便宜者胜),带外候选不参与竞争。逐对比较(差>带→强胜;
         // 差≤带→廉胜)在 ≥3 候选跨带时构成非传递环(排序结果实现相关),弃用;
         // 锚点算法是总序、确定性的,且等价于文档意图"cap gap > band → 强胜;带内 → 廉胜"。
-        let band = capability_band(s.cost_pressure);
+        let band = capability_band(s.cost_pressure) * band_bias;
         let max_cap = candidates
             .iter()
             .map(|c| c.capability)
@@ -287,7 +296,7 @@ mod tests {
             depends_on: vec![],
             risk: Risk::Low,
         }];
-        let table = dispatch(&subtasks, &profiles, 60.0, None);
+        let table = dispatch(&subtasks, &profiles, 60.0, None, 1.0);
         assert_eq!(table[0].model, "cheap");
     }
 
@@ -305,7 +314,7 @@ mod tests {
                 requirements: req.clone(), cost_pressure: CostPressure::Low,
                 depends_on: vec![], risk: Risk::Low,
             }];
-            assert_eq!(dispatch(&subtasks, &profiles, 60.0, None)[0].model, "reasoner");
+            assert_eq!(dispatch(&subtasks, &profiles, 60.0, None, 1.0)[0].model, "reasoner");
         }
     }
 
@@ -320,7 +329,7 @@ mod tests {
             requirements: Requirements { reasoning: 0.3, coding: 0.3, frontend: 0.2, backend: 0.2, math: 0.0, long_context: 0.0, ..Default::default() },
             cost_pressure: CostPressure::High, depends_on: vec![], risk: Risk::Low,
         }];
-        assert_eq!(dispatch(&subtasks, &profiles, 60.0, None)[0].model, "a"); // 高成本压力下便宜者胜
+        assert_eq!(dispatch(&subtasks, &profiles, 60.0, None, 1.0)[0].model, "a"); // 高成本压力下便宜者胜
     }
 
     #[test]
@@ -334,7 +343,7 @@ mod tests {
             requirements: Requirements { reasoning: 0.5, coding: 0.5, frontend: 0.0, backend: 0.0, math: 0.0, long_context: 0.0, ..Default::default() },
             cost_pressure: CostPressure::Low, depends_on: vec![], risk: Risk::High,
         }];
-        let table = dispatch(&subtasks, &profiles, 60.0, None);
+        let table = dispatch(&subtasks, &profiles, 60.0, None, 1.0);
         // 能力优先:strong(95) vs weak(40) 能力差远超带宽 → strong 直接胜,无需升级。
         assert_eq!(table[0].model, "strong");
         assert!(!table[0].escalated);
@@ -355,14 +364,14 @@ mod tests {
             requirements: Requirements { reasoning: 0.5, coding: 0.5, frontend: 0.0, backend: 0.0, math: 0.0, long_context: 0.0, ..Default::default() },
             cost_pressure: CostPressure::Low, depends_on: vec![], risk: Risk::Med,
         }];
-        let table = dispatch(&subtasks, &profiles, 60.0, None);
+        let table = dispatch(&subtasks, &profiles, 60.0, None, 1.0);
         assert_eq!(table[0].model, "strong", "capability gap > band → stronger model wins regardless of cost");
         // 同级(带内)时便宜者胜:strong vs strong-2(97 vs 95, 差 2 ≤ Low 带 3)→ 便宜的 strong 胜。
         let profiles2 = vec![
             profile("cheap", 97.0, 97.0, 97.0, 97.0, 0.1),
             profile("pricy", 99.0, 99.0, 99.0, 99.0, 10.0),
         ];
-        let table2 = dispatch(&subtasks, &profiles2, 60.0, None);
+        let table2 = dispatch(&subtasks, &profiles2, 60.0, None, 1.0);
         assert_eq!(table2[0].model, "cheap", "within band → cheaper model wins");
     }
 
@@ -382,7 +391,7 @@ mod tests {
             depends_on: vec![], risk: Risk::Low,
         }];
         for _ in 0..10 {
-            let table = dispatch(&subtasks, &profiles, 60.0, None);
+            let table = dispatch(&subtasks, &profiles, 60.0, None, 1.0);
             // bot(81) 带外不参与;带内 top(90)/mid(85) 比效率 → mid 更便宜胜。
             assert_eq!(table[0].model, "mid", "deterministic winner must be stable across runs");
         }
@@ -399,7 +408,7 @@ mod tests {
             cost_pressure: CostPressure::Med, // 带 7
             depends_on: vec![], risk: Risk::Low,
         }];
-        let table = dispatch(&subtasks, &profiles, 60.0, None);
+        let table = dispatch(&subtasks, &profiles, 60.0, None, 1.0);
         // 锚点 gpt-5.6-luna(95),带内 ≥ 88 → {deepseek-v4(92), gpt-5.6-luna(95)},
         // 带内最便宜 = deepseek-v4(0.1 < 10.0)。qwen(86) 在带外,不参与。
         assert_eq!(table[0].model, "deepseek-v4");
@@ -413,7 +422,7 @@ mod tests {
             requirements: Requirements { reasoning: 0.5, coding: 0.5, frontend: 0.0, backend: 0.0, math: 0.0, long_context: 0.0, ..Default::default() },
             cost_pressure: CostPressure::Low, depends_on: vec![], risk: Risk::Low,
         }];
-        assert!(dispatch(&subtasks, &[], 60.0, None).is_empty());
+        assert!(dispatch(&subtasks, &[], 60.0, None, 1.0).is_empty());
     }
 
     #[test]
@@ -438,4 +447,22 @@ mod tests {
     fn parse_subtask_graph_no_json_errors() {
         assert!(parse_subtask_graph("完全没有 JSON").is_err());
     }
+
+    #[test]
+    fn band_bias_widens_tolerance_toward_cheaper_models() {
+        // strong(90) vs cheap(80),gap 10 > Med 带 7 → bias=1.0 时 strong 胜;
+        // bias=2.0 时带 14,两者带内 → cheap 胜(更愿用便宜模型)。
+        let profiles = vec![
+            profile("strong", 90.0, 90.0, 90.0, 90.0, 5.0),
+            profile("cheap", 80.0, 80.0, 80.0, 80.0, 0.1),
+        ];
+        let subtasks = vec![Subtask {
+            id: "s".into(), description: "generic".into(),
+            requirements: Requirements { reasoning: 1.0, ..Default::default() },
+            cost_pressure: CostPressure::Med, depends_on: vec![], risk: Risk::Low,
+        }];
+        assert_eq!(dispatch(&subtasks, &profiles, 60.0, None, 1.0)[0].model, "strong");
+        assert_eq!(dispatch(&subtasks, &profiles, 60.0, None, 2.0)[0].model, "cheap");
+    }
+
 }

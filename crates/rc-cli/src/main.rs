@@ -530,6 +530,8 @@ struct CoreSection {
     /// 单个 route 子任务的超时秒数(默认 600):跑 cargo test 的编译型子任务
     /// 5 分钟(300s)常不够,之前 4 个 deepseek 子任务就是卡在编译被砍。
     subtask_timeout_secs: Option<u64>,
+    /// 路由成本偏置(默认 1.0):>1 放大能力容差带,更愿用便宜模型;<1 更能力优先。
+    cost_bias: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2575,6 +2577,8 @@ async fn route_command(
         emit.as_deref(),
         cancel,
         Some(&decompose_budget),
+        // P5:成本偏置,>1 放大能力容差带 → 更愿用便宜模型;默认 1.0(原语义)。
+        config.core.cost_bias.unwrap_or(1.0),
     )
     .await
     {

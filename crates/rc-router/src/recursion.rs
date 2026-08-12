@@ -63,7 +63,7 @@ pub fn gate_decides(
     if profiles.is_empty() {
         return GateDecision::Execute;
     }
-    let table = capability::dispatch(std::slice::from_ref(node), profiles, 60.0, None);
+    let table = capability::dispatch(std::slice::from_ref(node), profiles, 60.0, None, 1.0);
     let best = &table[0];
     let best_profile = profiles.iter().find(|p| p.model == best.model).unwrap();
     // 校准键与 CLI 写侧对齐(rc-cli record_stat `{model}|usage` → kind "tokens"),
@@ -107,6 +107,7 @@ pub async fn process(
     emit: Option<&(dyn Fn(AgentEvent) + Send + Sync)>,
     cancel: Option<&Arc<AtomicBool>>,
     budget: Option<&AtomicUsize>,
+    band_bias: f64,
 ) -> Result<ExecPlan, AllocatorError> {
     if profiles.is_empty() {
         return Err(AllocatorError::Empty);
@@ -115,7 +116,7 @@ pub async fn process(
         return Err(AllocatorError::Cancelled);
     }
     if depth >= MAX_DEPTH || is_homogeneous(&node.requirements, ALPHA) {
-        let table = capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None);
+        let table = capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None, band_bias);
         let entry = table.into_iter().next().unwrap();
         return Ok(ExecPlan { subtask: node.clone(), depth, action: ExecAction::Execute { entry }, basis: "homogeneous-or-depth".into() });
     }
@@ -139,7 +140,7 @@ pub async fn process(
     });
     if !can_decompose {
         let table =
-            capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None);
+            capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None, band_bias);
         let entry = table.into_iter().next().unwrap();
         return Ok(ExecPlan {
             subtask: node,
@@ -154,7 +155,7 @@ pub async fn process(
         Ok(g) => g,
         Err(_) => {
             let table =
-                capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None);
+                capability::dispatch(std::slice::from_ref(&node), profiles, 60.0, None, band_bias);
             let entry = table.into_iter().next().unwrap();
             return Ok(ExecPlan {
                 subtask: node,
@@ -171,7 +172,7 @@ pub async fn process(
         }
         // 先派活预览(能力×成本 argmax),拿自动选中的模型 → 发 Dispatch,
         // 让任务树在子任务解析出来时就长出来(顺序正确:先父后子)。
-        let preview = capability::dispatch(std::slice::from_ref(&child), profiles, 60.0, None)
+        let preview = capability::dispatch(std::slice::from_ref(&child), profiles, 60.0, None, band_bias)
             .into_iter()
             .next()
             .map(|e| e.model)
@@ -194,6 +195,7 @@ pub async fn process(
             emit,
             cancel,
             budget,
+            band_bias,
         ))
         .await?;
         children.push(plan);
@@ -295,7 +297,7 @@ mod tests {
             let events = events.clone();
             move |ev: AgentEvent| events.lock().unwrap().push(ev)
         };
-        let plan = process(root, 0, &profiles, &cost, &store, &StubAllocator, Some(&sink), None, None)
+        let plan = process(root, 0, &profiles, &cost, &store, &StubAllocator, Some(&sink), None, None, 1.0)
             .await
             .unwrap();
         // root 分解成 s1,s2(同质 → Execute)。
@@ -333,7 +335,7 @@ mod tests {
             risk: Risk::Low,
         };
         let cancel = Arc::new(AtomicBool::new(true));
-        let err = process(root, 0, &profiles, &cost, &store, &StubAllocator, None, Some(&cancel), None)
+        let err = process(root, 0, &profiles, &cost, &store, &StubAllocator, None, Some(&cancel), None, 1.0)
             .await
             .unwrap_err();
         assert!(matches!(err, AllocatorError::Cancelled));
@@ -354,7 +356,7 @@ mod tests {
         };
         // 预算 0 → 根节点不分解,直接 Execute(budget-exhausted)。
         let budget = AtomicUsize::new(0);
-        let plan = process(root, 0, &profiles, &cost, &store, &StubAllocator, None, None, Some(&budget))
+        let plan = process(root, 0, &profiles, &cost, &store, &StubAllocator, None, None, Some(&budget), 1.0)
             .await
             .unwrap();
         match plan.action {
