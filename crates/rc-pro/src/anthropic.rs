@@ -1,5 +1,8 @@
 use crate::canonical::{CanonicalMessage, CanonicalRequest, CanonicalRole, ProvEvent};
-use crate::provider::{parse_tool_arguments, ProvStream, Provider, ProviderConfig, ProviderError};
+use crate::provider::{
+    parse_tool_arguments, retry_provider_request, ProvStream, Provider, ProviderConfig,
+    ProviderError,
+};
 use crate::sse::{response_bytes, sse_events};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -33,20 +36,28 @@ impl Provider for AnthropicProvider {
         let base = self.cfg.base_url.trim_end_matches('/').to_string();
         let url = format!("{}/v1/messages", base);
         let body = build_anthropic_body(&req, &self.cfg.model);
-        let mut builder = client.post(&url).json(&body);
-        if let Some(key) = self.cfg.resolve_api_key() {
-            builder = builder.header("x-api-key", key);
-        }
-        builder = builder.header("anthropic-version", "2023-06-01");
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
+        let key = self.cfg.resolve_api_key();
+        // 503/429/5xx/传输抖动自动重试(最多 1+3 次);stream 返回后不再重试。
+        let resp = retry_provider_request(|| {
+            let mut builder = client.post(&url).json(&body);
+            if let Some(k) = key.as_deref() {
+                builder = builder.header("x-api-key", k);
+            }
+            builder = builder.header("anthropic-version", "2023-06-01");
+            async move {
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::Transport(e.to_string()))?;
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::Http { status, body });
+                }
+                Ok(resp)
+            }
+        })
+        .await?;
         Ok(map_anthropic_sse(sse_events(response_bytes(resp))))
     }
 

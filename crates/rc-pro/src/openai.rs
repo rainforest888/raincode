@@ -1,5 +1,8 @@
 use crate::canonical::{CanonicalMessage, CanonicalRequest, CanonicalRole, ProvEvent, ToolDef};
-use crate::provider::{parse_tool_arguments, ProvStream, Provider, ProviderConfig, ProviderError};
+use crate::provider::{
+    parse_tool_arguments, retry_provider_request, ProvStream, Provider, ProviderConfig,
+    ProviderError,
+};
 use crate::sse::{response_bytes, sse_events};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
@@ -152,19 +155,27 @@ impl Provider for OpenAiChatProvider {
         let client = self.cfg.client()?;
         let url = format!("{}/chat/completions", base(&self.cfg));
         let body = build_chat_body(&req, &self.cfg.model);
-        let mut builder = client.post(&url).json(&body);
-        if let Some(key) = self.cfg.resolve_api_key() {
-            builder = builder.bearer_auth(key);
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
+        let key = self.cfg.resolve_api_key();
+        // 503/429/5xx/传输抖动自动重试(最多 1+3 次);stream 返回后不再重试。
+        let resp = retry_provider_request(|| {
+            let mut builder = client.post(&url).json(&body);
+            if let Some(k) = key.as_deref() {
+                builder = builder.bearer_auth(k);
+            }
+            async move {
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::Transport(e.to_string()))?;
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::Http { status, body });
+                }
+                Ok(resp)
+            }
+        })
+        .await?;
         Ok(map_chat_sse(sse_events(response_bytes(resp))))
     }
 
@@ -394,19 +405,27 @@ impl Provider for OpenAiResponsesProvider {
         let client = self.cfg.client()?;
         let url = format!("{}/responses", base(&self.cfg));
         let body = build_responses_body(&req, &self.cfg.model);
-        let mut builder = client.post(&url).json(&body);
-        if let Some(key) = self.cfg.resolve_api_key() {
-            builder = builder.bearer_auth(key);
-        }
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
+        let key = self.cfg.resolve_api_key();
+        // 503/429/5xx/传输抖动自动重试(最多 1+3 次);stream 返回后不再重试。
+        let resp = retry_provider_request(|| {
+            let mut builder = client.post(&url).json(&body);
+            if let Some(k) = key.as_deref() {
+                builder = builder.bearer_auth(k);
+            }
+            async move {
+                let resp = builder
+                    .send()
+                    .await
+                    .map_err(|e| ProviderError::Transport(e.to_string()))?;
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(ProviderError::Http { status, body });
+                }
+                Ok(resp)
+            }
+        })
+        .await?;
         Ok(map_responses_sse(sse_events(response_bytes(resp))))
     }
 
