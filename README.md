@@ -2,6 +2,8 @@
 
 **自我进化的编程 agent(Rust 实现)——像 Claude Code 一样在终端里干活,但内置可学习的 skill 网络与多 agent 编排。**
 
+[![CI](https://github.com/rainforest888/raincode/actions/workflows/ci.yml/badge.svg)](https://github.com/rainforest888/raincode/actions/workflows/ci.yml)
+
 Raincode 是一个 Rust 编写的自主编码 agent:你在终端里给它一句话,它会像 Claude Code 一样思考、调用工具、读写文件、跑测试,直到完成任务。但它不止于此——
 
 ## 核心优势
