@@ -490,6 +490,42 @@ pub fn catalog() -> Vec<ProviderCatalogEntry> {
             models: &["yi-lightning", "yi-large", "yi-large-turbo", "yi-medium", "yi-medium-200k", "yi-vision-v2"],
             context_window: 200000,
         },
+        // OpenCode Go:低价开源编程模型订阅服务(base_url 见官网 docs/zh-cn/go)。
+        // 只列 OpenAI 兼容(/chat/completions)的模型;其余需按格式单独配 profile。
+        ProviderCatalogEntry {
+            id: "opencode-go",
+            display_name: "OpenCode Go",
+            kind: ProfileKind::OpenAiCompat,
+            base_url: "https://opencode.ai/zen/go/v1",
+            default_model: "deepseek-v4-flash",
+            env_var: Some("OPENCODE_GO_API_KEY"),
+            embedding_model: None,
+            models: &[
+                "deepseek-v4-flash",
+                "deepseek-v4-pro",
+                "glm-5.2",
+                "glm-5.1",
+                "kimi-k3",
+                "kimi-k2.7-code",
+                "kimi-k2.6",
+                "mimo-v2.5",
+                "mimo-v2.5-pro",
+                "grok-4.5",
+            ],
+            context_window: 1000000,
+        },
+        // 通用自定义(OpenAI 兼容):base_url 为空 → 向导里提示输入。
+        ProviderCatalogEntry {
+            id: "custom",
+            display_name: "自定义 (OpenAI 兼容)",
+            kind: ProfileKind::OpenAiCompat,
+            base_url: "",
+            default_model: "",
+            env_var: None,
+            embedding_model: None,
+            models: &[],
+            context_window: 0,
+        },
     ]
 }
 
@@ -527,6 +563,11 @@ mod tests {
     #[test]
     fn every_catalog_entry_has_at_least_one_model() {
         for entry in catalog() {
+            // custom 是空 base_url 的自由输入条目,无预设模型。
+            if entry.id == "custom" {
+                assert!(entry.base_url.is_empty());
+                continue;
+            }
             assert!(!entry.models.is_empty(), "{} has no models", entry.id);
             assert!(
                 !entry.default_model.is_empty(),

@@ -1717,12 +1717,16 @@ struct Setup {
     step: SetupStep,
     entry: Option<rc_profile::ProviderCatalogEntry>,
     model: Option<String>,
+    /// 自定义供应商的 base_url(entry.base_url 为空时,向导里提示输入)。
+    base_url: Option<String>,
 }
 
 #[derive(Default, PartialEq)]
 enum SetupStep {
     #[default]
     Provider,
+    /// 自定义(OpenAI 兼容)条目:先问 base_url,再问模型。
+    BaseUrl,
     Model,
     Key,
 }
@@ -1818,17 +1822,43 @@ async fn wizard_advance(
             match wizard_parse_provider(&answer) {
                 Some(entry) => {
                     setup.entry = Some(entry.clone());
-                    setup.step = SetupStep::Model;
-                    let items: Vec<String> = entry.models.iter().map(|m| m.to_string()).collect();
-                    wizard_list(model, &format!("{} 模型", entry.display_name), &items);
-                    wizard_ask(
-                        model,
-                        format!("{} 选模型编号或输入自定义 id:", entry.display_name),
-                        false,
-                        rx_holder,
-                    );
+                    if entry.base_url.is_empty() {
+                        // 自定义(OpenAI 兼容):先问 base_url。
+                        setup.step = SetupStep::BaseUrl;
+                        wizard_ask(
+                            model,
+                            "自定义:输入 base_url(如 https://api.example.com/v1,不含 /chat/completions):".into(),
+                            false,
+                            rx_holder,
+                        );
+                    } else {
+                        setup.step = SetupStep::Model;
+                        let items: Vec<String> = entry.models.iter().map(|m| m.to_string()).collect();
+                        wizard_list(model, &format!("{} 模型", entry.display_name), &items);
+                        wizard_ask(
+                            model,
+                            format!("{} 选模型编号或输入自定义 id:", entry.display_name),
+                            false,
+                            rx_holder,
+                        );
+                    }
                 }
                 None => wizard_ask(model, "无效编号,重新输入供应商编号 [1-12]:".into(), false, rx_holder),
+            }
+        }
+        SetupStep::BaseUrl => {
+            let base_url = answer.trim().trim_end_matches('/').to_string();
+            if base_url.is_empty() {
+                wizard_ask(model, "base_url 不能为空,重新输入:".into(), false, rx_holder);
+            } else {
+                setup.base_url = Some(base_url);
+                setup.step = SetupStep::Model;
+                wizard_ask(
+                    model,
+                    "输入模型 id(如 deepseek-v4-flash;输入任意值即可):".into(),
+                    false,
+                    rx_holder,
+                );
             }
         }
         SetupStep::Model => {
@@ -1880,7 +1910,10 @@ async fn save_wizard_profile(
         name: format!("{} ({})", entry.display_name, id),
         app: "raincode".into(),
         kind: entry.kind,
-        base_url: entry.base_url.to_string(),
+        base_url: setup
+            .base_url
+            .clone()
+            .unwrap_or_else(|| entry.base_url.to_string()),
         model: model_id.to_string(),
         api_key: None,
         api_key_env: entry.env_var.map(str::to_string),
