@@ -1494,7 +1494,7 @@ async fn execute_cmd(
                 let _ = store.append_message(
                     &model.session_id,
                     rc_state::MessageRole::User,
-                    &text,
+                    text,
                 );
             }
             model.done_at = None;
