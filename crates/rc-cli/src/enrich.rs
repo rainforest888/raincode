@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use rc_state::{CapabilityProfileRow, Store};
 use crate::FileConfig;
 
 /// OpenRouter 公开模型列表端点(无需 key)。返回 data 数组,每项含 id、
@@ -54,6 +55,51 @@ pub struct ResearchedModel {
 }
 
 fn default_price_source() -> String { "missing".to_string() }
+
+/// One merged output row for the final library (one per target bare-name model).
+/// Capability scores, per-1M pricing and context window come from the research
+/// report when it names them, else from the OpenRouter baseline row, else a
+/// synthesized default.
+#[allow(dead_code)] // written by Task 8's orchestration (enrich_command)
+#[derive(Debug, Clone)]
+pub struct EnrichedRow {
+    pub model: String,
+    pub reasoning: f64,
+    pub coding: f64,
+    pub frontend: f64,
+    pub backend: f64,
+    pub math: f64,
+    pub long_context: f64,
+    pub input_cost_per_m: f64,
+    pub output_cost_per_m: f64,
+    pub context_window: u32,
+    pub price_source: String,
+}
+
+/// Strip provider prefix and version suffix from a model id:
+/// `deepseek/deepseek-v4-flash-0731` -> `deepseek-v4-flash`,
+/// `qwen/qwen3.8-max` -> `qwen3.8-max` (trailing `-max` is not a version).
+#[allow(dead_code)] // used by build_final_rows/apply_enrichment (Task 8 wiring)
+pub fn bare_name(model_id: &str) -> String {
+    let last = model_id.rsplit('/').next().unwrap_or(model_id);
+    match last.rfind('-') {
+        Some(i)
+            if i > 0 && last[i + 1..].chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            last[..i].to_string()
+        }
+        _ => last.to_string(),
+    }
+}
+
+/// Does this DB/model row belong to the given bare-name group?
+/// e.g. `deepseek/deepseek-v4-flash-0731` matches `deepseek-v4-flash`;
+/// `deepseek-v4-flashx` does not (`x` is not a dash-joined version).
+#[allow(dead_code)] // delete-old scan in apply_enrichment (Task 8 wiring)
+fn matches_bare(row_model: &str, bare: &str) -> bool {
+    let last = row_model.rsplit('/').next().unwrap_or(row_model);
+    last == bare || last.strip_prefix(bare).is_some_and(|rest| rest.starts_with('-'))
+}
 
 /// Extract the first balanced JSON object from mixed text (handles reasoning noise
 /// around a code-fenced JSON block). Bracket-matching skips strings; returns the
@@ -124,9 +170,140 @@ async fn fetch_openrouter_baseline() -> Result<Vec<rc_state::CapabilityProfileRo
     baseline_from_json(&fetch_openrouter_raw().await?)
 }
 
+/// Pure merge: given the OpenRouter baseline rows, the research report, and the
+/// requested `--add` models, produce the final rows to write. One `EnrichedRow`
+/// per target bare name; for each target prefer the research report's chosen id
+/// (and its pricing/capabilities), else the baseline row for that bare name
+/// (scores kept), else a synthesized default (70s, cost 1.0/3.0, price openrouter).
+#[allow(dead_code)] // called by apply_enrichment (Task 8 wiring)
+pub fn build_final_rows(
+    baseline: &[CapabilityProfileRow],
+    report: &ResearchReport,
+    add: &[String],
+    top: usize,
+) -> Vec<EnrichedRow> {
+    use std::collections::BTreeMap;
+    // Target bare names: report.popular then --add, order preserved, deduped.
+    let mut targets: Vec<String> = Vec::new();
+    for bare in report.popular.iter().chain(add.iter()) {
+        if !targets.contains(bare) {
+            targets.push(bare.clone());
+        }
+    }
+    if targets.len() > top {
+        targets.truncate(top);
+    }
+    // baseline row per bare name (last row wins on duplicate versions).
+    let by_bare: BTreeMap<String, &CapabilityProfileRow> = baseline
+        .iter()
+        .map(|r| (bare_name(&r.model), r))
+        .collect();
+
+    let mut out = Vec::new();
+    for bare in targets {
+        // Prefer the research report's id for this bare name (its latest-flagged
+        // entry, else the first match); else any baseline row; else synthesize.
+        let researched = report
+            .models
+            .iter()
+            .filter(|m| bare_name(&m.id) == bare)
+            .min_by_key(|m| if m.latest == Some(true) { 0 } else { 1 });
+        let base = by_bare.get(&bare).copied();
+        out.push(EnrichedRow {
+            model: researched
+                .map(|m| m.id.clone())
+                .or_else(|| base.map(|b| b.model.clone()))
+                .unwrap_or_else(|| bare.clone()),
+            reasoning: researched
+                .and_then(|m| m.reasoning)
+                .or_else(|| base.map(|b| b.reasoning))
+                .unwrap_or(70.0),
+            coding: researched
+                .and_then(|m| m.coding)
+                .or_else(|| base.map(|b| b.coding))
+                .unwrap_or(70.0),
+            frontend: researched
+                .and_then(|m| m.frontend)
+                .or_else(|| base.map(|b| b.frontend))
+                .unwrap_or(70.0),
+            backend: researched
+                .and_then(|m| m.backend)
+                .or_else(|| base.map(|b| b.backend))
+                .unwrap_or(70.0),
+            math: researched
+                .and_then(|m| m.math)
+                .or_else(|| base.map(|b| b.math))
+                .unwrap_or(70.0),
+            long_context: researched
+                .and_then(|m| m.long_context)
+                .or_else(|| base.map(|b| b.long_context))
+                .unwrap_or(100.0),
+            input_cost_per_m: researched
+                .and_then(|m| m.input_cost_per_m)
+                .or_else(|| base.map(|b| b.input_cost_per_m))
+                .unwrap_or(1.0),
+            output_cost_per_m: researched
+                .and_then(|m| m.output_cost_per_m)
+                .or_else(|| base.map(|b| b.output_cost_per_m))
+                .unwrap_or(3.0),
+            context_window: researched
+                .and_then(|m| m.context_window)
+                .or_else(|| base.map(|b| b.context_window))
+                .unwrap_or(128_000),
+            price_source: researched
+                .map(|m| m.price_source.clone())
+                .unwrap_or_else(|| "openrouter".into()),
+        });
+    }
+    out
+}
+
+/// Apply enrichment to the store: merge into final rows, then for each row delete
+/// every existing DB row in the same bare-name group except this one (keep-latest /
+/// delete-old), then upsert. Returns the rows it would write (for printing).
+/// No writes happen when `dry_run`.
+#[allow(dead_code)] // called by Task 8's enrich_command orchestration
+pub async fn apply_enrichment(
+    store: &Store,
+    report: &ResearchReport,
+    add: &[String],
+    top: usize,
+    dry_run: bool,
+) -> Result<Vec<EnrichedRow>> {
+    let baseline = store.all_model_profiles()?;
+    let final_rows = build_final_rows(&baseline, report, add, top);
+    if dry_run {
+        return Ok(final_rows);
+    }
+    for row in &final_rows {
+        let bare = bare_name(&row.model);
+        for e in &baseline {
+            if e.model != row.model && matches_bare(&e.model, &bare) {
+                store.delete_model_profile(&e.model)?;
+            }
+        }
+        store.upsert_model_profile(&CapabilityProfileRow {
+            model: row.model.clone(),
+            reasoning: row.reasoning,
+            coding: row.coding,
+            frontend: row.frontend,
+            backend: row.backend,
+            math: row.math,
+            long_context: row.long_context.min(100.0),
+            input_cost_per_m: row.input_cost_per_m,
+            output_cost_per_m: row.output_cost_per_m,
+            context_window: row.context_window,
+            source: "enrich".into(),
+            updated_at: "now".into(),
+            multimodal: false,
+        })?;
+    }
+    Ok(final_rows)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{baseline_from_json, parse_agent_output};
+    use super::*;
 
     #[test]
     fn parse_agent_output_accepts_fenced_json() {
@@ -156,5 +333,127 @@ mod tests {
         assert_eq!(rows[0].input_cost_per_m, 2.0);       // 0.000002 * 1e6
         assert_eq!(rows[0].coding, 71.8);
         assert!((rows[0].frontend - 73.75).abs() < 0.01); // (1295-1000)/400*100
+    }
+
+    #[test]
+    fn bare_name_strips_provider_and_version() {
+        assert_eq!(bare_name("deepseek/deepseek-v4-flash-0731"), "deepseek-v4-flash");
+        assert_eq!(bare_name("qwen/qwen3.8-max"), "qwen3.8-max");
+        assert_eq!(bare_name("deepseek-v4-flash"), "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn matches_bare_finds_version_variants() {
+        assert!(matches_bare("deepseek/deepseek-v4-flash-0731", "deepseek-v4-flash"));
+        assert!(matches_bare("deepseek/deepseek-v4-flash", "deepseek-v4-flash"));
+        assert!(!matches_bare("qwen/qwen3.8-max", "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn build_final_rows_uses_research_id_and_pricing() {
+        let baseline = vec![rc_state::CapabilityProfileRow {
+            model: "deepseek/deepseek-v4-flash-0731".into(),
+            reasoning: 51.8, coding: 69.1, frontend: 65.2, backend: 65.0,
+            math: 51.8, long_context: 90.0,
+            input_cost_per_m: 0.08, output_cost_per_m: 0.18, context_window: 1048576,
+            source: "openrouter-arena".into(), updated_at: "now".into(), multimodal: false,
+        }];
+        let report = ResearchReport {
+            popular: vec!["deepseek-v4-flash".into()],
+            models: vec![ResearchedModel {
+                id: "deepseek/deepseek-v4-flash-0731".into(), latest: Some(true),
+                reasoning: None, coding: None, frontend: None, backend: None, math: None,
+                long_context: None, input_cost_per_m: Some(0.05), output_cost_per_m: Some(0.1),
+                context_window: None, price_source: "opencode".into(),
+            }],
+        };
+        let rows = build_final_rows(&baseline, &report, &[], 15);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_cost_per_m, 0.05); // agent's opencode price wins
+        assert_eq!(rows[0].coding, 69.1);            // baseline score kept
+        assert_eq!(rows[0].price_source, "opencode");
+    }
+
+    #[test]
+    fn build_final_rows_synthesizes_default_for_unknown_model() {
+        let report = ResearchReport {
+            popular: vec!["brand-new-model".into()],
+            models: vec![],
+        };
+        let rows = build_final_rows(&[], &report, &[], 15);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "brand-new-model");
+        assert_eq!(rows[0].reasoning, 70.0);
+        assert_eq!(rows[0].input_cost_per_m, 1.0);
+        assert_eq!(rows[0].price_source, "openrouter");
+    }
+
+    #[tokio::test]
+    async fn apply_enrichment_deletes_old_version_keeps_latest() {
+        let store = Store::open_in_memory().unwrap();
+        let insert = |model: &str| {
+            store
+                .upsert_model_profile(&rc_state::CapabilityProfileRow {
+                    model: model.into(), reasoning: 50.0, coding: 50.0, frontend: 50.0,
+                    backend: 50.0, math: 50.0, long_context: 50.0,
+                    input_cost_per_m: 0.1, output_cost_per_m: 0.2, context_window: 1000,
+                    source: "test".into(), updated_at: "now".into(), multimodal: false,
+                })
+                .unwrap()
+        };
+        insert("deepseek/deepseek-v4-flash-0721");
+        insert("deepseek/deepseek-v4-flash-0731");
+        insert("qwen/qwen3.8-max");
+
+        let report = ResearchReport {
+            popular: vec!["deepseek-v4-flash".into()],
+            models: vec![ResearchedModel {
+                id: "deepseek/deepseek-v4-flash-0731".into(), latest: Some(true),
+                reasoning: None, coding: None, frontend: None, backend: None, math: None,
+                long_context: None, input_cost_per_m: None, output_cost_per_m: None,
+                context_window: None, price_source: "missing".into(),
+            }],
+        };
+        let rows = apply_enrichment(&store, &report, &[], 15, false).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "deepseek/deepseek-v4-flash-0731");
+
+        let mut remaining: Vec<String> = store
+            .all_model_profiles()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.model)
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["deepseek/deepseek-v4-flash-0731", "qwen/qwen3.8-max"]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_enrichment_dry_run_writes_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_model_profile(&rc_state::CapabilityProfileRow {
+                model: "deepseek/deepseek-v4-flash-0721".into(),
+                reasoning: 50.0, coding: 50.0, frontend: 50.0, backend: 50.0,
+                math: 50.0, long_context: 50.0,
+                input_cost_per_m: 0.1, output_cost_per_m: 0.2, context_window: 1000,
+                source: "test".into(), updated_at: "now".into(), multimodal: false,
+            })
+            .unwrap();
+
+        let report = ResearchReport {
+            popular: vec!["deepseek-v4-flash".into()],
+            models: vec![],
+        };
+        let rows = apply_enrichment(&store, &report, &[], 15, true).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "deepseek/deepseek-v4-flash-0721");
+
+        let remaining = store.all_model_profiles().unwrap();
+        assert_eq!(remaining.len(), 1, "dry_run must not delete or upsert");
+        assert_eq!(remaining[0].model, "deepseek/deepseek-v4-flash-0721");
     }
 }
