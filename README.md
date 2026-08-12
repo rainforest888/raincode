@@ -154,4 +154,4 @@ cargo clippy --workspace --all-targets  # 零警告
 
 ## License
 
-Apache-2.0
+MIT
