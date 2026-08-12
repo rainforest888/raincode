@@ -838,6 +838,22 @@ fn edit_input(model: &mut ReplModel, key: KeyEvent) {
 
 pub(crate) fn handle_key(model: &mut ReplModel, key: KeyEvent) -> Action {
     use KeyCode::*;
+    // 鼠标滚轮 / PageUp/PageDown:任何状态下(含 pending 审批、选择器)都能滚动
+    // 对话历史——滚轮被映射成 PageUp/PageDown。否则 pending 分支会把它们当
+    // 普通编辑键吞掉,setup 向导/审批时历史就滚不动了。
+    if key.modifiers.is_empty() {
+        match key.code {
+            PageUp => {
+                model.scroll_up(5);
+                return Action::None;
+            }
+            PageDown => {
+                model.scroll_down(5);
+                return Action::None;
+            }
+            _ => {}
+        }
+    }
     if model.pending.is_some() {
         // 审批/守卫:单键回答(Y/N/A / 0-3),不进输入栏;问题仍需 Enter+文本。
         // 排除 Ctrl 组合:Ctrl+C 仍走下方 resolve_pending("") 的拒绝路径,不当成键入 'c'。
@@ -1056,15 +1072,7 @@ pub(crate) fn handle_key(model: &mut ReplModel, key: KeyEvent) -> Action {
             model.toggle_reasoning();
             Action::None
         }
-        // PageUp/PageDown:对话区翻页(5 行/页)。上滚解锁自动滚动,下滚到底重新贴底。
-        PageUp => {
-            model.scroll_up(5);
-            Action::None
-        }
-        PageDown => {
-            model.scroll_down(5);
-            Action::None
-        }
+        // (PageUp/PageDown 已在 handle_key 顶部处理,任何模式可滚)
         _ => {
             edit_input(model, key);
             model.update_slash_menu();
@@ -2465,6 +2473,32 @@ mod tests {
         assert!(matches!(action, Action::None));
         assert_eq!(m.scroll_offset, 0);
         assert!(m.autoscroll, "page down back to bottom re-pins");
+    }
+
+    #[test]
+    fn scroll_works_while_pending_prompt_active() {
+        // setup 向导/审批等 pending 状态下,PageUp/PageDown 也必须能滚动历史
+        // (否则 pending 分支会把它们当编辑键吞掉 → 滚轮失效)。
+        let mut m = ReplModel::new("s1".into(), "gpt-5".into(), 128_000);
+        for i in 0..10 {
+            m.push_line(format!("l{i}"), LineStyle::Plain);
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        m.set_pending_approval(
+            ApprovalRequest {
+                tool: "run_shell".into(),
+                description: "d".into(),
+                args: serde_json::json!({}),
+            },
+            tx,
+        );
+        assert!(m.pending.is_some());
+        // pending 状态下 PageUp 仍滚动(而不是被 pending 分支吞掉)。
+        let action = handle_key(&mut m, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(matches!(action, Action::None));
+        assert_eq!(m.scroll_offset, 5, "scroll must work even while pending");
+        // pending 未被误消费。
+        assert!(m.pending.is_some());
     }
 
     #[test]
