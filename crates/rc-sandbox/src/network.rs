@@ -4,9 +4,11 @@ use url::Url;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyDefault {
+    /// 默认放行:web_fetch/web_search 开箱即用。上传/密钥外发仍由 guard 的
+    /// 上传意图 + 密钥扫描拦截(否则 agent 完全无法联网查资料)。
     #[default]
-    Deny,
     Allow,
+    Deny,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

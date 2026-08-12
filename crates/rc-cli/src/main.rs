@@ -1393,6 +1393,7 @@ async fn agent_config(
                     .map_err(|e| e.to_string())?;
                 let mut tools = default_tools(skill_store.clone());
                 tools.retain(|t| t.spec().name != "delegate_research");
+                tools.extend(network_tools(SearchConfig::default()));
                 let cfg = AgentConfig {
                     provider,
                     plan_provider: None,
@@ -2923,7 +2924,12 @@ fn collect_executable(
                     review_provider: None,
                     store,
                     skill_store: skill_store.clone(),
-                    tools: default_tools(skill_store),
+                    // 子代理也要能联网查资料(web_fetch/web_search)。
+                    tools: {
+                        let mut t = default_tools(skill_store.clone());
+                        t.extend(network_tools(SearchConfig::default()));
+                        t
+                    },
                     // 子代理授权钩子:TUI 传 risk_approval_hook(跟随共享风险档,
                     // Auto 放行/Manual 拒绝/Ask 弹审批);CLI 传 None → 按 config。
                     approval: subagent_approval.clone().unwrap_or_else(|| {
