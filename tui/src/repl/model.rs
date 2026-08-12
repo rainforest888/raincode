@@ -251,8 +251,7 @@ pub struct SessionEntry {
 
 /// 交互式会话选择器(/resume):搜索 + ↑↓ + Enter,模式同 ModelPicker。
 #[derive(Debug, Clone)]
-pub struct SessionPicker {
-    pub all: Vec<SessionEntry>,
+pub struct SessionPicker {    pub all: Vec<SessionEntry>,
     /// 匹配 query 的条目在 `all` 里的下标。
     pub filtered: Vec<usize>,
     pub query: String,
@@ -296,6 +295,14 @@ impl SessionPicker {
     }
 }
 
+/// setup 向导的简单选择器:展示候选列表 + 高亮下标。↑↓ 移动,Enter 确认,
+/// 也支持直接输入编号(仍走 pending 提问)。
+#[derive(Debug, Clone)]
+pub struct SetupPicker {
+    pub items: Vec<String>,
+    pub selected: usize,
+}
+
 #[derive(Clone)]
 pub struct ReplModel {
     pub phase: Phase,
@@ -335,6 +342,9 @@ pub struct ReplModel {
     pub model_picker: Option<ModelPicker>,
     /// 交互式会话选择器(/resume):搜索 + ↑↓ + Enter。
     pub session_picker: Option<SessionPicker>,
+    /// setup 向导选择器:↑↓ 移动高亮,Enter 确认(按高亮项编号喂给向导);
+    /// 也支持直接输入编号 + Enter。
+    pub setup_picker: Option<SetupPicker>,
     /// 对话回合数(用户提交一次 +1;HUD 显示)。
     pub turn_count: u64,
     /// 本轮 tool 调用数(完成汇报用;start_run 时清零)。
@@ -401,6 +411,7 @@ impl ReplModel {
             slash_menu: None,
             model_picker: None,
             session_picker: None,
+            setup_picker: None,
             turn_count: 0,
             tool_calls: 0,
             files_touched: Vec::new(),
@@ -1077,6 +1088,7 @@ impl ReplModel {
 
     pub fn resolve_pending(&mut self, answer: &str) {
         self.approval_wait = None;
+        self.setup_picker = None; // 向导提问已回答,清掉选择器高亮
         if let Some(pending) = self.pending.take() {
             match pending {
                 PendingPrompt::Approval { req: _, reply } => {

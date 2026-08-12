@@ -177,6 +177,18 @@ pub fn tool_pending_verb(name: &str) -> &'static str {
 /// live 行栈（自底向上）：streaming / thinking / tool。底部 HUD 之下。
 fn render_live(model: &ReplModel, width: usize, now: Instant) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    // setup 向导选择器:高亮当前项(↑↓ 移动,Enter 确认,或输入编号+Enter)。
+    if let Some(p) = &model.setup_picker {
+        let idx = p.selected.min(p.items.len().saturating_sub(1));
+        let item = p.items.get(idx).map(String::as_str).unwrap_or("");
+        out.push(paint(
+            &truncate_line(
+                &format!("▸ [{}] {item}   (↑↓ 选择 · Enter 确认 · 或输入编号+Enter)", idx + 1),
+                width,
+            ),
+            LineStyle::Accent,
+        ));
+    }
     // pending_steers 预览:运行中提交但未注入的 steer 队列(codex 式,最多 3 条)。
     for s in model.pending_steers.iter().take(3) {
         out.push(paint(

@@ -92,7 +92,20 @@ pub trait ReplEnv {
     /// (TUI 共享 Arc 的当前值,驱动 CLI 侧 `RiskState` 的棘轮升级策略)。
     /// `supervisor` 为 Some 时(监督会话已启动)route_run 把子代理事件
     /// (AgentSpawned/AgentToolCall/AgentResult)转发一份到 `feed`,由 TUI 主循环
-    /// 周期排空并调用 `Supervisor::should_judge`/`judge`。
+    /// 周期排空并调用 `Supervisor::should_judge`/`judge`。`subagent_approval` 是
+    /// 子代理的授权钩子:传 TUI 的 risk_approval_hook → 子代理跟随共享风险档
+    /// (Auto 放行 / Manual 拒绝 / Ask 弹审批),不再无条件自动放行。
     #[allow(clippy::too_many_arguments)]
-    fn route_run(&self, prompt: String, plan_only: bool, emit: Arc<dyn Fn(rc_proto::AgentEvent) + Send + Sync>, steer_hub: Arc<rc_core::SteerHub>, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>, risk_mode: rc_router::risk::RiskMode, supervisor: Option<std::sync::Arc<rc_core::Supervisor>>, feed: AgentFeed);
+    fn route_run(
+        &self,
+        prompt: String,
+        plan_only: bool,
+        emit: Arc<dyn Fn(rc_proto::AgentEvent) + Send + Sync>,
+        steer_hub: Arc<rc_core::SteerHub>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        risk_mode: rc_router::risk::RiskMode,
+        subagent_approval: std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
+        supervisor: Option<std::sync::Arc<rc_core::Supervisor>>,
+        feed: AgentFeed,
+    );
 }

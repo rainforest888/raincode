@@ -188,6 +188,7 @@ impl raincode_tui::repl::env::ReplEnv for FileEnv {
         steer_hub: Arc<rc_core::SteerHub>,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         risk_mode: rc_router::risk::RiskMode,
+        subagent_approval: std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
         supervisor: Option<Arc<rc_core::Supervisor>>,
         feed: raincode_tui::repl::env::AgentFeed,
     ) {
@@ -230,7 +231,7 @@ impl raincode_tui::repl::env::ReplEnv for FileEnv {
                 Some(routed_emit),
                 Some(steer_hub),
                 Some(&cancel),
-                true, // TUI:子代理自动放行(用户已批准整个任务;避免 stdin 审批阻塞)
+                Some(subagent_approval), // TUI:子代理跟随共享风险档
                 risk_mode,
             ));
             if let Err(e) = result {
@@ -623,7 +624,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         Some(Command::Skills { cmd }) => skills_command(&config, cmd).await,
         Some(Command::Model { cmd }) => model_command(&config, cmd).await,
         Some(Command::Route { prompt, plan_only, pool, pin }) => {
-            route_command(&config, &prompt, plan_only, pool, pin.as_deref(), false, None, None, None, false, rc_router::risk::RiskMode::Ask).await
+            route_command(&config, &prompt, plan_only, pool, pin.as_deref(), false, None, None, None, None, rc_router::risk::RiskMode::Ask).await
         }
         Some(Command::Profiles { cmd }) => profiles_command(&config, cmd).await,
         Some(Command::Mcp { cmd }) => mcp_command(&config, cmd).await,
@@ -2424,7 +2425,8 @@ async fn route_command(
     emit: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     steer_hub: Option<Arc<rc_core::SteerHub>>,
     cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    auto_approve_subagents: bool,
+    // TUI 传入 risk_approval_hook → 子代理跟随共享风险档;CLI 传 None → 按 config。
+    subagent_approval: Option<Arc<dyn rc_sandbox::ApprovalHook>>,
     risk_mode: rc_router::risk::RiskMode,
 ) -> Result<()> {
     let registry = load_registry()?;
@@ -2564,7 +2566,7 @@ async fn route_command(
     let mut leaf_ids = std::collections::HashSet::new();
     collect_leaf_ids(&plan, &mut leaf_ids);
     let mut jobs = Vec::new();
-    collect_executable(&plan, &mut jobs, &leaf_ids, config, &registry, &skill_dir, auto_approve_subagents)?;
+    collect_executable(&plan, &mut jobs, &leaf_ids, config, &registry, &skill_dir, subagent_approval)?;
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
         if let Some(emit) = &emit {
             emit(AgentEvent::Error { message: "cancelled by user".into() });
@@ -2867,7 +2869,7 @@ fn collect_executable(
     config: &FileConfig,
     registry: &Registry,
     skill_dir: &Path,
-    auto_approve_subagents: bool,
+    subagent_approval: Option<Arc<dyn rc_sandbox::ApprovalHook>>,
 ) -> Result<()> {
     match &plan.action {
         rc_router::recursion::ExecAction::Execute { entry } => {
@@ -2922,12 +2924,11 @@ fn collect_executable(
                     store,
                     skill_store: skill_store.clone(),
                     tools: default_tools(skill_store),
-                    // TUI 下子代理自动放行(用户已批准整个任务);CLI route 保持按 approval_mode 询问。
-                    approval: if auto_approve_subagents {
-                        std::sync::Arc::new(AutoApproveHook)
-                    } else {
+                    // 子代理授权钩子:TUI 传 risk_approval_hook(跟随共享风险档,
+                    // Auto 放行/Manual 拒绝/Ask 弹审批);CLI 传 None → 按 config。
+                    approval: subagent_approval.clone().unwrap_or_else(|| {
                         approval_hook(config.core.approval_mode.as_deref().unwrap_or("ask"))
-                    },
+                    }),
                     command_policy: CommandPolicy {
                         allow: config.sandbox.commands.allow.clone(),
                         deny: config.sandbox.commands.deny.clone(),
@@ -2971,7 +2972,7 @@ fn collect_executable(
         }
         rc_router::recursion::ExecAction::Decompose { children } => {
             for c in children {
-                collect_executable(c, jobs, leaf_ids, config, registry, skill_dir, auto_approve_subagents)?;
+                collect_executable(c, jobs, leaf_ids, config, registry, skill_dir, subagent_approval.clone())?;
             }
             Ok(())
         }
@@ -3526,7 +3527,7 @@ async fn handle_rpc(config: &FileConfig, request: Request) -> Result<Option<Resp
                 .get("pin")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            route_command(config, &prompt, false, pool, pin.as_deref(), true, Some(emit), None, None, false, rc_router::risk::RiskMode::Ask).await?;
+            route_command(config, &prompt, false, pool, pin.as_deref(), true, Some(emit), None, None, None, rc_router::risk::RiskMode::Ask).await?;
             Ok(Some(Response::ok(id, json!({"ok": true, "command": "route"}))))
         }
         RequestMethod::Stop => Ok(None),

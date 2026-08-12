@@ -146,6 +146,7 @@ fn start_route_run(
     run_cancel: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     steer_hub: &std::sync::Arc<rc_core::SteerHub>,
     risk_mode: &std::sync::Arc<std::sync::Mutex<rc_router::risk::RiskMode>>,
+    subagent_approval: &std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
     supervisor: &Option<std::sync::Arc<rc_core::Supervisor>>,
     feed: &AgentFeed,
     env: &dyn ReplEnv,
@@ -172,6 +173,7 @@ fn start_route_run(
         hub,
         cancel,
         risk_mode,
+        subagent_approval.clone(),
         supervisor.clone(),
         feed.clone(),
     );
@@ -293,6 +295,8 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
     let risk_mode = std::sync::Arc::new(std::sync::Mutex::new(rc_router::risk::RiskMode::Ask));
     let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookMsg>();
     agent_cfg.approval = risk_approval_hook(&hook_tx, risk_mode.clone());
+    // 子代理授权钩子 = 主 agent 的 risk 钩子:route 子代理跟随共享风险档。
+    let subagent_approval = agent_cfg.approval.clone();
     agent_cfg.user_input = repl_user_hook(&hook_tx);
     // 授权闸 hook:高危操作(工作区外/上传/deny 命中)弹 0/1/2/3 四选一。
     // guard_cfg/guard_memo/guard_home 已由 FileEnv::agent_config 从 supervise.toml 加载。
@@ -450,6 +454,7 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                                     &mut mode_override,
                                     &mut thinking,
                                     &risk_mode,
+                                    &subagent_approval,
                                     &supervisor,
                                     &agent_feed,
                                     env,
@@ -664,7 +669,7 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                             &mut chat_handle, &mut chat_history, &mut registry,
                             &skill_dir, &steer_hub, &mut run_cancel,
                             &mut mode_override, &mut thinking, &risk_mode,
-                            &supervisor, &agent_feed, env,
+                            &subagent_approval, &supervisor, &agent_feed, env,
                         ).await? {
                             quit = true;
                         }
@@ -694,7 +699,7 @@ pub async fn repl_command(env: &dyn ReplEnv) -> Result<()> {
                         start_route_run(
                             &mut model, &event_tx, prompt, false,
                             &mut run_cancel, &steer_hub, &risk_mode,
-                            &supervisor, &agent_feed, env,
+                            &subagent_approval, &supervisor, &agent_feed, env,
                         );
                     } else {
                         model.push_line("已取消执行".into(), LineStyle::Dim);
@@ -860,6 +865,39 @@ pub(crate) fn handle_key(model: &mut ReplModel, key: KeyEvent) -> Action {
                 return Action::None;
             }
             _ => {}
+        }
+    }
+    // setup 向导选择器:↑↓ 移动高亮,Enter 确认(按高亮项编号喂给向导),Esc 关闭。
+    // 编号仍可直接输入 + Enter(走下方 pending 分支)。
+    if model.setup_picker.is_some() {
+        let (confirm, close) = match key.code {
+            Up if key.modifiers.is_empty() => {
+                if let Some(p) = &mut model.setup_picker {
+                    p.selected = p.selected.saturating_sub(1);
+                }
+                (false, false)
+            }
+            Down if key.modifiers.is_empty() => {
+                if let Some(p) = &mut model.setup_picker {
+                    p.selected = (p.selected + 1) % p.items.len();
+                }
+                (false, false)
+            }
+            Enter if key.modifiers.is_empty() => (true, true),
+            Esc => (false, true),
+            _ => (false, false),
+        };
+        if confirm {
+            let pick = model.setup_picker.as_ref().map(|p| p.selected + 1).unwrap_or(1);
+            model.setup_picker = None;
+            if model.pending.is_some() {
+                model.resolve_pending(&pick.to_string());
+            }
+            return Action::None;
+        }
+        if close {
+            model.setup_picker = None;
+            return Action::None;
         }
     }
     if model.pending.is_some() {
@@ -1165,6 +1203,7 @@ async fn execute_cmd(
     mode_override: &mut Option<Difficulty>,
     thinking: &mut ThinkingFlow,
     risk_mode: &std::sync::Arc<std::sync::Mutex<rc_router::risk::RiskMode>>,
+    subagent_approval: &std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
     supervisor: &Option<std::sync::Arc<rc_core::Supervisor>>,
     feed: &AgentFeed,
     env: &dyn ReplEnv,
@@ -1249,7 +1288,7 @@ async fn execute_cmd(
                 thinking.prompt = Some(text.clone());
                 start_route_run(
                     model, event_tx, text.clone(), true,
-                    run_cancel, steer_hub, risk_mode,
+                    run_cancel, steer_hub, risk_mode, subagent_approval,
                     supervisor, feed, env,
                 );
             } else {
@@ -1384,7 +1423,7 @@ async fn execute_cmd(
             // route_run 自起独立线程 + runtime,主循环保持响应(期间可 Tab 选 agent + 发 steer)。
             start_route_run(
                 model, event_tx, prompt.to_string(), false,
-                run_cancel, steer_hub, risk_mode,
+                run_cancel, steer_hub, risk_mode, subagent_approval,
                 supervisor, feed, env,
             );
             *task_handle = None; // route 在独立线程,主循环 task_handle 不跟踪它
@@ -1417,7 +1456,7 @@ async fn execute_cmd(
             // 事件经 emit 转发;主循环保持响应(期间可 Tab 选 agent + 发 steer)。
             start_route_run(
                 model, event_tx, prompt, plan_only,
-                run_cancel, steer_hub, risk_mode,
+                run_cancel, steer_hub, risk_mode, subagent_approval,
                 supervisor, feed, env,
             );
             *task_handle = None; // autonomous 在独立线程,主循环 task_handle 不跟踪它
@@ -1752,6 +1791,13 @@ fn wizard_list(model: &mut ReplModel, title: &str, items: &[String]) {
     model.push_line(format!("— {title} —"), LineStyle::Warn);
     for (i, item) in items.iter().enumerate() {
         model.push_line(format!("  [{}] {item}", i + 1), LineStyle::Dim);
+    }
+    // 启用 ↑↓ 选择器:高亮移动 + Enter 确认(编号仍可直接输入+Enter)。
+    if !items.is_empty() {
+        model.setup_picker = Some(crate::repl::model::SetupPicker {
+            items: items.to_vec(),
+            selected: 0,
+        });
     }
 }
 
@@ -2194,6 +2240,7 @@ mod tests {
                 _steer_hub: std::sync::Arc<rc_core::SteerHub>,
                 _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
                 _risk_mode: rc_router::risk::RiskMode,
+                _subagent_approval: std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
                 _supervisor: Option<std::sync::Arc<rc_core::Supervisor>>,
                 _feed: AgentFeed,
             ) {
@@ -3082,6 +3129,7 @@ mod tests {
             _steer_hub: std::sync::Arc<rc_core::SteerHub>,
             _cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
             _risk_mode: rc_router::risk::RiskMode,
+            _subagent_approval: std::sync::Arc<dyn rc_sandbox::ApprovalHook>,
             _supervisor: Option<std::sync::Arc<rc_core::Supervisor>>,
             _feed: AgentFeed,
         ) {
