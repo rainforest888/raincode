@@ -12,7 +12,9 @@ use crate::repl::command;
 use crate::repl::editor::InputEditor;
 use crate::repl::fmt::{format_elapsed, format_tokens, truncate_line, truncate_output};
 
-pub const OUTPUT_BOUND: usize = 200;
+/// 对话区显示缓存上限(行)。200 太小,长会话的历史会被滚掉;调到 5000 让
+/// 大部分会话的历史都能滚回查看(真实持久化在 state.db,这只是显示缓存)。
+pub const OUTPUT_BOUND: usize = 5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

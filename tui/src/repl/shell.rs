@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::queue;
 use crossterm::style::Print;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, event};
 
@@ -31,10 +32,13 @@ impl Shell {
         };
         execute!(s.stdout, EnterAlternateScreen)?;
         execute!(s.stdout, Hide)?;
+        // 捕获鼠标:滚轮上/下滚动对话历史。离开时 DisableMouseCapture。
+        execute!(s.stdout, EnableMouseCapture)?;
         Ok(s)
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
+        execute!(self.stdout, DisableMouseCapture)?;
         execute!(self.stdout, Show)?;
         execute!(self.stdout, LeaveAlternateScreen)?;
         disable_raw_mode()?;
@@ -108,6 +112,23 @@ pub fn read_keys(tx: tokio::sync::mpsc::UnboundedSender<event::KeyEvent>) -> io:
                 }
                 if tx.send(key).is_err() {
                     return Ok(());
+                }
+            }
+            // 鼠标滚轮 → 合成 PageUp/PageDown,复用 B7 的滚动逻辑(上滚解锁自动滚动)。
+            event::Event::Mouse(me) => {
+                let key = match me.kind {
+                    event::MouseEventKind::ScrollUp => {
+                        Some(event::KeyEvent::new(event::KeyCode::PageUp, event::KeyModifiers::NONE))
+                    }
+                    event::MouseEventKind::ScrollDown => {
+                        Some(event::KeyEvent::new(event::KeyCode::PageDown, event::KeyModifiers::NONE))
+                    }
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    if tx.send(key).is_err() {
+                        return Ok(());
+                    }
                 }
             }
             event::Event::Resize(_, _) => {} // 下一帧自动按新尺寸重绘
