@@ -22,7 +22,8 @@ use rc_profile::model::{Profile, ProfileKind, Registry};
 use rc_profile::writers::all_writers;
 use rc_profile::{delete_key, find_provider, key_ref, protect_profile, store_key};
 use rc_proto::{encode_line, AgentEvent, Request, RequestMethod, Response, RpcError};
-use rc_router::capability::CapabilityProfile;
+use rc_router::capability::{CapabilityProfile, Requirements, Subtask};
+use rc_router::execute::SubtaskResult;
 use rc_router::execute_subtasks_batched;
 use rc_router::recursion::{ExecAction, ExecPlan};
 use rc_router::risk::{EscalationTrigger, RiskState};
@@ -2615,7 +2616,7 @@ async fn route_command(
     let mut leaf_ids = std::collections::HashSet::new();
     collect_leaf_ids(&plan, &mut leaf_ids);
     let mut jobs = Vec::new();
-    collect_executable(&plan, &mut jobs, &leaf_ids, config, &registry, &skill_dir, subagent_approval)?;
+    collect_executable(&plan, &mut jobs, &leaf_ids, config, &registry, &skill_dir, subagent_approval.clone())?;
     if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
         if let Some(emit) = &emit {
             emit(AgentEvent::Error { message: "cancelled by user".into() });
@@ -2632,7 +2633,7 @@ async fn route_command(
     // execute_subtasks_batched 按依赖分批执行,结果回灌 OrchestratorResult。
     let subtask_timeout =
         std::time::Duration::from_secs(config.core.subtask_timeout_secs.unwrap_or(600));
-    let results = execute_subtasks_batched(
+    let mut results = execute_subtasks_batched(
         jobs,
         &store,
         2,
@@ -2651,6 +2652,37 @@ async fn route_command(
                 "[route] 警告:子任务执行后工作区 cargo check 失败 —— 可能有子任务产出未编译通过"
             ),
             Err(e) => tracing::warn!("post-route cargo check 跳过: {e}"),
+        }
+    }
+    // 4.4b) P2b:provider 故障转移 —— 因 503/429/5xx/传输错误失败(非任务逻辑)
+    //      的子任务,重派到池内另一能力模型(最多一次)。治某端点整场宕机(如
+    //      qwen3.8-max 连挂 17 分钟)导致的级联失败。重派用新模型、独立会话,
+    //      steer_hub 传 None(重派阶段不支持 steering,可接受)。
+    let failover_jobs = build_failover_jobs(
+        &results,
+        &plan,
+        config,
+        &registry,
+        &profiles,
+        &skill_dir,
+        subagent_approval,
+    )?;
+    if !failover_jobs.is_empty() {
+        println!("[route] 故障转移:{} 个子任务重派到备用模型", failover_jobs.len());
+        let rerun = execute_subtasks_batched(
+            failover_jobs,
+            &store,
+            2,
+            subtask_timeout,
+            emit.clone(),
+            None, // steer_hub 已在前一轮 move;重派阶段不接 steering。
+            cancel.cloned(),
+        )
+        .await;
+        for r in rerun {
+            if let Some(slot) = results.iter_mut().find(|fr| fr.subtask_id == r.subtask_id) {
+                *slot = r;
+            }
         }
     }
     // 4.5) 终局:取消发 cancelled(已中断),否则发 Done 复位 TUI phase。
@@ -2925,6 +2957,178 @@ fn collect_leaf_ids(plan: &rc_router::recursion::ExecPlan, out: &mut std::collec
 /// 把 ExecPlan 树的 Execute 叶子扁平化成 `(subtask_id, prompt, depends_on, AgentConfig)`,
 /// depends_on = 该子任务的依赖过滤到确实在本批叶子里的 id。AgentConfig 复用旧
 /// route_command 的构造(provider 回退链:精确 .model 匹配 → 活跃 profile → 第一个 profile)。
+/// 追加到每个可执行子任务 prompt 的验收要求(P3 编译门禁,collect 与故障转移复用)。
+const SUBTASK_VERIFY_REQ: &str = "\n\n[验收要求] 若你修改了任何 .rs 源码文件,必须在结束前运行 \
+     `cargo check -p <受影响的 crate>`(或 `cargo test -p <crate>`)确认编译/测试通过; \
+     编译失败或测试失败不算完成,需继续修复直到通过。若确实无法通过,明确报告任务失败,不要谎报完成。";
+
+/// 子任务失败是否因 provider 暂时不可用(503/429/5xx 或传输错误),值得故障转移重派。
+fn is_provider_failure(summary: &str) -> bool {
+    let s = summary.to_lowercase();
+    s.contains("transport error")
+        || (s.contains("provider error")
+            && (s.contains("http status 5") || s.contains("http status 429")))
+}
+
+/// 在 ExecPlan 树里按 id 找子任务(取 description/requirements 用于重派)。
+fn find_plan_subtask<'a>(plan: &'a ExecPlan, id: &str) -> Option<&'a Subtask> {
+    if plan.subtask.id == id {
+        return Some(&plan.subtask);
+    }
+    match &plan.action {
+        ExecAction::Decompose { children } => children.iter().find_map(|c| find_plan_subtask(c, id)),
+        ExecAction::Execute { .. } => None,
+    }
+}
+
+/// 从池里挑一个能力分最高的模型作为备用,排除已失败的模型。
+fn pick_fallback_model(
+    profiles: &[CapabilityProfile],
+    req: &Requirements,
+    failed_bare: &str,
+) -> Option<String> {
+    profiles
+        .iter()
+        .filter(|p| p.model != failed_bare)
+        .max_by(|a, b| a.capability_score(req).total_cmp(&b.capability_score(req)))
+        .map(|p| p.model.clone())
+}
+
+/// P2b:把因 provider 故障失败的子任务重排成备用模型的 job(最多一次,不递归)。
+fn build_failover_jobs(
+    results: &[SubtaskResult],
+    plan: &ExecPlan,
+    config: &FileConfig,
+    registry: &Registry,
+    profiles: &[CapabilityProfile],
+    skill_dir: &Path,
+    subagent_approval: Option<std::sync::Arc<dyn rc_sandbox::ApprovalHook>>,
+) -> Result<Vec<(String, String, Vec<String>, AgentConfig)>> {
+    let mut jobs = Vec::new();
+    for r in results {
+        if r.ok || !is_provider_failure(&r.summary) {
+            continue;
+        }
+        let Some(subtask) = find_plan_subtask(plan, &r.subtask_id) else {
+            continue;
+        };
+        // SubtaskResult.model 形如 `openai-compat:qwen3.8-max`,取冒号后裸名。
+        let failed_bare = r.model.rsplit(':').next().unwrap_or(&r.model).to_string();
+        let Some(fallback) = pick_fallback_model(profiles, &subtask.requirements, &failed_bare)
+        else {
+            continue;
+        };
+        if fallback == failed_bare {
+            continue;
+        }
+        let cfg =
+            build_subtask_config(config, registry, skill_dir, &fallback, subagent_approval.clone())?;
+        jobs.push((
+            r.subtask_id.clone(),
+            format!("{}{SUBTASK_VERIFY_REQ}", subtask.description),
+            vec![],
+            cfg,
+        ));
+    }
+    Ok(jobs)
+}
+
+/// 按裸模型名构建 route 子任务 AgentConfig(collect_executable 与 provider
+/// 故障转移重派共用)。provider 从 registry 按 model 匹配,缺省回退活跃 profile。
+fn build_subtask_config(
+    config: &FileConfig,
+    registry: &Registry,
+    skill_dir: &Path,
+    model: &str,
+    subagent_approval: Option<std::sync::Arc<dyn rc_sandbox::ApprovalHook>>,
+) -> Result<AgentConfig> {
+    let profile = registry
+        .profiles
+        .iter()
+        .find(|p| p.model == model)
+        .or_else(|| registry.active())
+        .or_else(|| registry.profiles.first())
+        .ok_or_else(|| anyhow!("no provider profiles configured; run `raincode model add`"))?;
+    let provider = provider_for_profile(registry, Some(&profile.id))?;
+    let skill_store = SkillStore::new(skill_dir);
+    let workspace = config
+        .core
+        .workspace
+        .as_deref()
+        .map(expand_tilde)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let store = Store::open(state_path())?;
+    // 子代理上下文窗口复用 context_for_model(DB 能力画像),而非硬编码 0(0 → 128k 兜底)。
+    let context_window = context_for_model(&store, registry);
+    // 监督守卫:route 子代理也带守卫(不可绕过);无 hook → 高危操作保守拦截。
+    let guard_cfg = match rc_sandbox::load_supervise_config(&raincode_home()) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!("supervise.toml 解析失败,守卫关闭: {e}");
+            None
+        }
+    };
+    let guard_memo = guard_cfg
+        .as_ref()
+        .map(|_| std::sync::Arc::new(rc_sandbox::guard_hook::SessionGuardMemo::default()));
+    let guard_home = guard_cfg.as_ref().map(|_| raincode_home());
+    Ok(AgentConfig {
+        provider,
+        plan_provider: None,
+        review_provider: None,
+        store,
+        skill_store: skill_store.clone(),
+        // 子代理也要能联网查资料(web_fetch/web_search)。
+        tools: {
+            let mut t = default_tools(skill_store.clone());
+            t.extend(network_tools(SearchConfig::default()));
+            t
+        },
+        // 子代理授权钩子:TUI 传 risk_approval_hook(跟随共享风险档,
+        // Auto 放行/Manual 拒绝/Ask 弹审批);CLI 传 None → 按 config。
+        approval: subagent_approval.unwrap_or_else(|| {
+            approval_hook(config.core.approval_mode.as_deref().unwrap_or("ask"))
+        }),
+        command_policy: CommandPolicy {
+            allow: config.sandbox.commands.allow.clone(),
+            deny: config.sandbox.commands.deny.clone(),
+        },
+        network_policy: network_policy(config),
+        cwd: workspace.clone(),
+        state_path: state_path(),
+        // 子代理按上下文限制而非步数上限:给足轮次(至少 48),让它能
+        // 先探索再实现,完成任务自然停(模型不再调工具即结束)。用户
+        // 配置的 max_turns 只作为下限,不再成为复杂子任务的硬卡点。
+        max_turns: config.core.max_turns.unwrap_or(24).max(48),
+        max_steps: 0,
+        evolve_on_finish: config.evolve.enabled.unwrap_or(true),
+        plan_mode: false,
+        hooks: config.hooks.clone(),
+        agent: Some(
+            config
+                .core
+                .agent
+                .clone()
+                .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        ),
+        max_history_bytes: config.core.max_history_bytes,
+        mcp_servers: vec![],
+        entropy_mode: false,
+        plan_max_rounds: config.entropy.plan_max_rounds.unwrap_or(6),
+        plan_max_questions: config.entropy.plan_max_questions.unwrap_or(5),
+        review_max_rounds: config.entropy.review_max_rounds.unwrap_or(3),
+        max_cycles: config.entropy.max_cycles.unwrap_or(3),
+        user_input: user_input_hook(false),
+        steer_rx: None,
+        context_window,
+        subagent: None,
+        guard_cfg,
+        guard_hook: None,
+        guard_memo,
+        guard_home,
+    })
+}
+
 fn collect_executable(
     plan: &rc_router::recursion::ExecPlan,
     jobs: &mut Vec<(String, String, Vec<String>, AgentConfig)>,
@@ -2936,38 +3140,7 @@ fn collect_executable(
 ) -> Result<()> {
     match &plan.action {
         rc_router::recursion::ExecAction::Execute { entry } => {
-            let profile = registry
-                .profiles
-                .iter()
-                .find(|p| p.model == entry.model)
-                .or_else(|| registry.active())
-                .or_else(|| registry.profiles.first())
-                .ok_or_else(|| {
-                    anyhow!("no provider profiles configured; run `raincode model add`")
-                })?;
-            let provider = provider_for_profile(registry, Some(&profile.id))?;
-            let skill_store = SkillStore::new(skill_dir);
-            let workspace = config
-                .core
-                .workspace
-                .as_deref()
-                .map(expand_tilde)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-            let store = Store::open(state_path())?;
-            // 子代理上下文窗口复用 context_for_model(DB 能力画像),而非硬编码 0(0 → 128k 兜底)。
-            let context_window = context_for_model(&store, registry);
-            // 监督守卫:route 子代理也带守卫(不可绕过);无 hook → 高危操作保守拦截。
-            let guard_cfg = match rc_sandbox::load_supervise_config(&raincode_home()) {
-                Ok(cfg) => Some(cfg),
-                Err(e) => {
-                    tracing::warn!("supervise.toml 解析失败,守卫关闭: {e}");
-                    None
-                }
-            };
-            let guard_memo = guard_cfg
-                .as_ref()
-                .map(|_| std::sync::Arc::new(rc_sandbox::guard_hook::SessionGuardMemo::default()));
-            let guard_home = guard_cfg.as_ref().map(|_| raincode_home());
+            let cfg = build_subtask_config(config, registry, skill_dir, &entry.model, subagent_approval)?;
             // 依赖排序:只保留确实是本批叶子任务的依赖(自我依赖剔除)。
             let depends_on: Vec<String> = plan
                 .subtask
@@ -2978,68 +3151,9 @@ fn collect_executable(
                 .collect();
             jobs.push((
                 plan.subtask.id.clone(),
-                format!(
-                    "{}\n\n[验收要求] 若你修改了任何 .rs 源码文件,必须在结束前运行 \
-                     `cargo check -p <受影响的 crate>`(或 `cargo test -p <crate>`)确认编译/测试通过; \
-                     编译失败或测试失败不算完成,需继续修复直到通过。若确实无法通过,明确报告任务失败,不要谎报完成。",
-                    plan.subtask.description
-                ),
+                format!("{}{SUBTASK_VERIFY_REQ}", plan.subtask.description),
                 depends_on,
-                AgentConfig {
-                    provider,
-                    plan_provider: None,
-                    review_provider: None,
-                    store,
-                    skill_store: skill_store.clone(),
-                    // 子代理也要能联网查资料(web_fetch/web_search)。
-                    tools: {
-                        let mut t = default_tools(skill_store.clone());
-                        t.extend(network_tools(SearchConfig::default()));
-                        t
-                    },
-                    // 子代理授权钩子:TUI 传 risk_approval_hook(跟随共享风险档,
-                    // Auto 放行/Manual 拒绝/Ask 弹审批);CLI 传 None → 按 config。
-                    approval: subagent_approval.clone().unwrap_or_else(|| {
-                        approval_hook(config.core.approval_mode.as_deref().unwrap_or("ask"))
-                    }),
-                    command_policy: CommandPolicy {
-                        allow: config.sandbox.commands.allow.clone(),
-                        deny: config.sandbox.commands.deny.clone(),
-                    },
-                    network_policy: network_policy(config),
-                    cwd: workspace.clone(),
-                    state_path: state_path(),
-                    // 子代理按上下文限制而非步数上限:给足轮次(至少 48),让它能
-                    // 先探索再实现,完成任务自然停(模型不再调工具即结束)。用户
-                    // 配置的 max_turns 只作为下限,不再成为复杂子任务的硬卡点。
-                    max_turns: config.core.max_turns.unwrap_or(24).max(48),
-                    max_steps: 0,
-                    evolve_on_finish: config.evolve.enabled.unwrap_or(true),
-                    plan_mode: false,
-                    hooks: config.hooks.clone(),
-                    agent: Some(
-                        config
-                            .core
-                            .agent
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-                    ),
-                    max_history_bytes: config.core.max_history_bytes,
-                    mcp_servers: vec![],
-                    entropy_mode: false,
-                    plan_max_rounds: config.entropy.plan_max_rounds.unwrap_or(6),
-                    plan_max_questions: config.entropy.plan_max_questions.unwrap_or(5),
-                    review_max_rounds: config.entropy.review_max_rounds.unwrap_or(3),
-                    max_cycles: config.entropy.max_cycles.unwrap_or(3),
-                    user_input: user_input_hook(false),
-                    steer_rx: None,
-                    context_window,
-                    subagent: None,
-                    guard_cfg,
-                    guard_hook: None,
-                    guard_memo,
-                    guard_home,
-                },
+                cfg,
             ));
             Ok(())
         }
@@ -4144,5 +4258,55 @@ mod tests {
         assert_eq!(recs[0].root, "root-index");
         assert_eq!(recs[0].task_signature, "alpha beta gamma delta");
         nav_cleanup(&root);
+    }
+
+    #[test]
+    fn provider_failure_detection() {
+        assert!(is_provider_failure("provider error: http status 503: upstream down"));
+        assert!(is_provider_failure("provider error: http status 500: boom"));
+        assert!(is_provider_failure("provider error: http status 429: rate limited"));
+        assert!(is_provider_failure("provider error: http transport error: error sending request"));
+        assert!(!is_provider_failure("task failed: compile error in x.rs"));
+        assert!(!is_provider_failure("provider error: http status 400: bad request"));
+    }
+
+    #[test]
+    fn fallback_picks_best_capability_excluding_failed() {
+        let mk = |m: &str, reasoning: f64| CapabilityProfile {
+            model: m.into(), reasoning, coding: 70.0, frontend: 70.0, backend: 70.0,
+            math: 70.0, long_context: 70.0, input_cost_per_m: 1.0, output_cost_per_m: 3.0,
+            context_window: 128_000, provenance: "test".into(), multimodal: false,
+        };
+        let profiles = vec![mk("qwen3.8-max", 58.0), mk("deepseek-v4-flash", 52.0), mk("mimo-v2.5", 38.0)];
+        let req = Requirements { reasoning: 1.0, ..Default::default() };
+        // 失败的是 qwen → 备用应为能力次高的 deepseek。
+        assert_eq!(pick_fallback_model(&profiles, &req, "qwen3.8-max").as_deref(), Some("deepseek-v4-flash"));
+        // 失败的是 mimo → 备用应为 qwen。
+        assert_eq!(pick_fallback_model(&profiles, &req, "mimo-v2.5").as_deref(), Some("qwen3.8-max"));
+        // 池里只剩失败模型时返回 None(不重派)。
+        assert_eq!(pick_fallback_model(&[mk("qwen3.8-max", 58.0)], &req, "qwen3.8-max"), None);
+    }
+
+    #[test]
+    fn find_plan_subtask_walks_nested_plan() {
+        use rc_router::recursion::ExecAction;
+        use rc_router::capability::Subtask;
+        let leaf = ExecPlan {
+            subtask: Subtask { id: "s2".into(), description: "do it".into(),
+                requirements: Requirements::default(), cost_pressure: rc_router::capability::CostPressure::Med,
+                depends_on: vec![], risk: rc_router::capability::Risk::Low },
+            depth: 1, action: ExecAction::Execute { entry: DispatchEntry {
+                subtask_id: "s2".into(), model: "qwen3.8-max".into(), capability: 1.0,
+                efficiency: 1.0, score: 1.0, escalated: false } },
+            basis: "b".into(),
+        };
+        let root = ExecPlan {
+            subtask: Subtask { id: "root".into(), description: "root".into(),
+                requirements: Requirements::default(), cost_pressure: rc_router::capability::CostPressure::Med,
+                depends_on: vec![], risk: rc_router::capability::Risk::Low },
+            depth: 0, action: ExecAction::Decompose { children: vec![leaf] }, basis: "b".into(),
+        };
+        assert_eq!(find_plan_subtask(&root, "s2").map(|s| s.description.as_str()), Some("do it"));
+        assert!(find_plan_subtask(&root, "nope").is_none());
     }
 }
