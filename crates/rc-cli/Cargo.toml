@@ -1,0 +1,40 @@
+﻿[package]
+name = "rc-cli"
+description = "Raincode command line interface: run/serve/daemon/evolve/insights/skills/model/mcp/proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "raincode"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dirs = { workspace = true }
+reqwest = { workspace = true }
+rc-core = { workspace = true }
+rc-pro = { workspace = true }
+rc-proto = { workspace = true }
+rc-profile = { workspace = true }
+rc-router = { workspace = true }
+rc-skill = { workspace = true }
+rc-state = { workspace = true }
+rc-evolve = { workspace = true }
+rc-tool = { workspace = true }
+rc-mcp = { workspace = true }
+rc-net = { workspace = true }
+rc-sandbox = { workspace = true }
+rc-gateway = { workspace = true }
+raincode-tui = { workspace = true }

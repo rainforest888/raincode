@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node (JS 原型已移除)
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Raincode runtime
+~/.raincode/
+.raincode/
+
+# 个人/本地文件(不发布到 GitHub)
+calculator.html
+calculator.py
+test_calculator.py
+test/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+[package]
+name = "rc-tool"
+description = "Raincode built-in tools and tool registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+rc-sandbox = { workspace = true }
+rc-skill = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+filetime = { workspace = true }

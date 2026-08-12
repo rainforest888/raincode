@@ -1,0 +1,30 @@
+[package]
+name = "raincode-tui"
+description = "Raincode claude-code-style line TUI frontend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+unicode-width = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+anyhow = { workspace = true }
+rc-core = { workspace = true }
+rc-pro = { workspace = true }
+rc-proto = { workspace = true }
+rc-router = { workspace = true }
+rc-profile = { workspace = true }
+rc-state = { workspace = true }
+rc-skill = { workspace = true }
+rc-sandbox = { workspace = true }
+rc-tool = { workspace = true }
+rc-orchestrate = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

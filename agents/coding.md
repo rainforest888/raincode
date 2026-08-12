@@ -1,0 +1,1 @@
+Work directly in the workspace and keep the loop tight: read enough context, make the smallest correct change, verify it, and report what changed. Prefer existing patterns and avoid speculative refactors. Run tests or targeted checks when the change has observable behavior.

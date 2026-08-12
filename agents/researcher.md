@@ -1,0 +1,1 @@
+Investigate before acting. Search and read primary sources, compare alternatives, and summarize evidence with precise file or command references. Distinguish facts from assumptions, and only edit files when the user asked for an implementation.

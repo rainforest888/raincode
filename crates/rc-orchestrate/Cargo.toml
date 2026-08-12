@@ -1,0 +1,10 @@
+[package]
+name = "rc-orchestrate"
+description = "Autonomous orchestration data structures (task tree + todo) shared by the TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# tree/todo 是纯 Rust 数据结构,无外部依赖。编排执行引擎在 rc-router。
+[dependencies]

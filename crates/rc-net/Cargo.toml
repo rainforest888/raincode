@@ -1,0 +1,21 @@
+﻿[package]
+name = "rc-net"
+description = "Raincode web fetch/search tools bound by the sandbox network policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+rc-sandbox = { workspace = true }
+rc-tool = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,22 @@
+﻿[package]
+name = "rc-gateway"
+description = "Raincode CC-Switch-compatible HTTP gateway with OpenAI/Anthropic endpoints and live profile switching"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rc-pro = { workspace = true }
+rc-profile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

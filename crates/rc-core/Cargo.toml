@@ -1,0 +1,29 @@
+[package]
+name = "rc-core"
+description = "Raincode agent loop: skill-aware context, tool execution, persistence and evolution trigger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+rc-pro = { workspace = true }
+rc-proto = { workspace = true }
+rc-state = { workspace = true }
+rc-skill = { workspace = true }
+rc-tool = { workspace = true }
+rc-sandbox = { workspace = true }
+rc-evolve = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+filetime = { workspace = true }
