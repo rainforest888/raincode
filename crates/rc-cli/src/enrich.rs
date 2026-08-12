@@ -68,7 +68,6 @@ fn default_price_source() -> String { "missing".to_string() }
 /// Capability scores, per-1M pricing and context window come from the research
 /// report when it names them, else from the OpenRouter baseline row, else a
 /// synthesized default.
-#[allow(dead_code)] // written by Task 8's orchestration (enrich_command)
 #[derive(Debug, Clone)]
 pub struct EnrichedRow {
     pub model: String,
@@ -87,7 +86,6 @@ pub struct EnrichedRow {
 /// Strip provider prefix and version suffix from a model id:
 /// `deepseek/deepseek-v4-flash-0731` -> `deepseek-v4-flash`,
 /// `qwen/qwen3.8-max` -> `qwen3.8-max` (trailing `-max` is not a version).
-#[allow(dead_code)] // used by build_final_rows/apply_enrichment (Task 8 wiring)
 pub fn bare_name(model_id: &str) -> String {
     let last = model_id.rsplit('/').next().unwrap_or(model_id);
     match last.rfind('-') {
@@ -103,7 +101,6 @@ pub fn bare_name(model_id: &str) -> String {
 /// Does this DB/model row belong to the given bare-name group?
 /// e.g. `deepseek/deepseek-v4-flash-0731` matches `deepseek-v4-flash`;
 /// `deepseek-v4-flashx` does not (`x` is not a dash-joined version).
-#[allow(dead_code)] // delete-old scan in apply_enrichment (Task 8 wiring)
 fn matches_bare(row_model: &str, bare: &str) -> bool {
     let last = row_model.rsplit('/').next().unwrap_or(row_model);
     last == bare || last.strip_prefix(bare).is_some_and(|rest| rest.starts_with('-'))
@@ -152,8 +149,7 @@ pub fn parse_agent_output(raw: &str) -> Result<ResearchReport> {
 }
 
 /// 研究 agent 提示词构建:给定目标裸名列表与榜单 top N,产出 JSON 输出契约。
-/// 纯函数(可测);真实调用在 enrich_command(Task 8 编排)。
-#[allow(dead_code)] // wired by enrich_command (Task 8)
+/// 纯函数(可测);真实调用在 enrich_command。
 pub fn build_research_prompt(targets: &[String], top: usize) -> String {
     format!(
         "You are researching model pricing and benchmark scores for a coding-agent model pool.\n\
@@ -180,10 +176,9 @@ pub fn build_research_prompt(targets: &[String], top: usize) -> String {
 
 /// 一次性研究子代理:装配 default_tools(去掉 delegate_research 防递归派发)+
 /// 网络工具(web_fetch/web_search),跑研究提示词并返回最终文本(应含 JSON)。
-/// 交互定价兜底发生在 agent 返回之后的 enrich_command(Task 8),因此这里用
+/// 交互定价兜底发生在 agent 返回之后的 enrich_command,因此这里用
 /// AutoUserHook 不请求用户输入。守卫照 agent_config 工厂镜像加载 supervise.toml;
 /// 无 guard_hook → 高危操作保守拦截(研究 agent 只读网络)。
-#[allow(dead_code)] // wired by enrich_command (Task 8)
 async fn run_research_agent(
     config: &FileConfig,
     registry: &Registry,
@@ -270,8 +265,92 @@ async fn run_research_agent(
     Ok(final_text.trim().to_string())
 }
 
-pub async fn enrich_command(_config: &FileConfig, _args: EnrichArgs) -> Result<()> {
-    Err(anyhow::anyhow!("enrich: not implemented yet"))
+/// 最终汇总表:每行一个目标模型,打印能力分、每百万 token 输入价与上下文。
+fn print_summary(rows: &[EnrichedRow]) {
+    println!("model | reasoning | coding | frontend | backend | $/M in | ctx | price_src");
+    for r in rows {
+        println!(
+            "{:<38} {:>7.1} {:>6.1} {:>7.1} {:>6.1} {:>9.4} {:>8} {}",
+            r.model, r.reasoning, r.coding, r.frontend, r.backend,
+            r.input_cost_per_m, r.context_window, r.price_source
+        );
+    }
+}
+
+/// For models the agent couldn't price ("missing"), ask the user interactively;
+/// non-interactive (or empty/invalid answer) falls back to the baseline
+/// OpenRouter price. `user_input_hook` returns `Arc<dyn rc_sandbox::UserInputHook>`
+/// whose single method is `async fn ask(&self, question: &str) -> String`.
+async fn resolve_missing_prices(
+    rows: &mut [EnrichedRow],
+    baseline: &[CapabilityProfileRow],
+    interactive: bool,
+) -> Result<()> {
+    let hook = crate::user_input_hook(interactive);
+    for row in rows.iter_mut() {
+        if row.price_source != "missing" {
+            continue;
+        }
+        let fallback = baseline
+            .iter()
+            .find(|b| bare_name(&b.model) == bare_name(&row.model))
+            .map(|b| b.input_cost_per_m);
+        let question = format!(
+            "模型 {} 的价格没能在网上找到。请你自己搜一下它的每百万 token 输入价格($/M)，\
+             直接输入数字(如 0.5)，或回车用 OpenRouter 基准价({:?})",
+            row.model, fallback
+        );
+        let answer = hook.ask(&question).await.trim().to_string();
+        if let Ok(p) = answer.parse::<f64>() {
+            row.input_cost_per_m = p;
+            row.price_source = "user".into();
+        } else if let Some(f) = fallback {
+            row.input_cost_per_m = f;
+            row.price_source = "openrouter".into();
+        }
+    }
+    Ok(())
+}
+
+/// `profiles enrich` 完整编排:确定性 OpenRouter 基准 → 一次性研究 agent →
+/// 合并 + 交互定价兜底 → 写库(或 dry-run) → 汇总打印。
+pub async fn enrich_command(config: &FileConfig, args: EnrichArgs) -> Result<()> {
+    let registry = crate::load_registry()?;
+    let store = Store::open(crate::state_path())?;
+
+    // 1) deterministic baseline
+    println!("[enrich] fetching OpenRouter baseline ...");
+    let baseline = fetch_openrouter_baseline().await?;
+    println!("[enrich] baseline: {} models", baseline.len());
+
+    // 2) research agent
+    let prompt = build_research_prompt(&args.add, args.top);
+    println!(
+        "[enrich] research agent researching top {} + {} extra ...",
+        args.top,
+        args.add.len()
+    );
+    let raw = run_research_agent(config, &registry, args.model.as_deref(), &prompt).await?;
+    let report = parse_agent_output(&raw)?;
+    println!(
+        "[enrich] report: popular={} researched={}",
+        report.popular.len(),
+        report.models.len()
+    );
+
+    // 3) merge + interactive pricing fallback
+    let mut final_rows = build_final_rows(&baseline, &report, &args.add, args.top);
+    resolve_missing_prices(&mut final_rows, &baseline, !args.dry_run).await?;
+
+    // 4) apply (or dry-run) + summary
+    if args.dry_run {
+        println!("[enrich] DRY-RUN: would write {} rows", final_rows.len());
+    } else {
+        apply_enrichment(&store, &final_rows, false).await?;
+        println!("[enrich] wrote {} rows", final_rows.len());
+    }
+    print_summary(&final_rows);
+    Ok(())
 }
 
 /// 拉取 OpenRouter /api/v1/models 原始 JSON(薄 reqwest 包装,可测部分在
@@ -302,7 +381,6 @@ async fn fetch_openrouter_baseline() -> Result<Vec<rc_state::CapabilityProfileRo
 /// per target bare name; for each target prefer the research report's chosen id
 /// (and its pricing/capabilities), else the baseline row for that bare name
 /// (scores kept), else a synthesized default (70s, cost 1.0/3.0, price openrouter).
-#[allow(dead_code)] // called by apply_enrichment (Task 8 wiring)
 pub fn build_final_rows(
     baseline: &[CapabilityProfileRow],
     report: &ResearchReport,
@@ -385,24 +463,19 @@ pub fn build_final_rows(
     out
 }
 
-/// Apply enrichment to the store: merge into final rows, then for each row delete
-/// every existing DB row in the same bare-name group except this one (keep-latest /
-/// delete-old), then upsert. Returns the rows it would write (for printing).
-/// No writes happen when `dry_run`.
-#[allow(dead_code)] // called by Task 8's enrich_command orchestration
+/// Apply enrichment to the store: for each final row, delete every existing DB
+/// row in the same bare-name group except this one (keep-latest / delete-old),
+/// then upsert. No writes happen when `dry_run`.
 pub async fn apply_enrichment(
     store: &Store,
-    report: &ResearchReport,
-    add: &[String],
-    top: usize,
+    final_rows: &[EnrichedRow],
     dry_run: bool,
-) -> Result<Vec<EnrichedRow>> {
-    let baseline = store.all_model_profiles()?;
-    let final_rows = build_final_rows(&baseline, report, add, top);
+) -> Result<()> {
     if dry_run {
-        return Ok(final_rows);
+        return Ok(());
     }
-    for row in &final_rows {
+    let baseline = store.all_model_profiles()?;
+    for row in final_rows {
         let bare = bare_name(&row.model);
         for e in &baseline {
             if e.model != row.model && matches_bare(&e.model, &bare) {
@@ -425,7 +498,7 @@ pub async fn apply_enrichment(
             multimodal: false,
         })?;
     }
-    Ok(final_rows)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -549,9 +622,11 @@ mod tests {
                 context_window: None, price_source: "missing".into(),
             }],
         };
-        let rows = apply_enrichment(&store, &report, &[], 15, false).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].model, "deepseek/deepseek-v4-flash-0731");
+        let baseline = store.all_model_profiles().unwrap();
+        let final_rows = build_final_rows(&baseline, &report, &[], 15);
+        assert_eq!(final_rows.len(), 1);
+        assert_eq!(final_rows[0].model, "deepseek/deepseek-v4-flash-0731");
+        apply_enrichment(&store, &final_rows, false).await.unwrap();
 
         let mut remaining: Vec<String> = store
             .all_model_profiles()
@@ -583,12 +658,27 @@ mod tests {
             popular: vec!["deepseek-v4-flash".into()],
             models: vec![],
         };
-        let rows = apply_enrichment(&store, &report, &[], 15, true).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].model, "deepseek/deepseek-v4-flash-0721");
+        let baseline = store.all_model_profiles().unwrap();
+        let final_rows = build_final_rows(&baseline, &report, &[], 15);
+        assert_eq!(final_rows.len(), 1);
+        assert_eq!(final_rows[0].model, "deepseek/deepseek-v4-flash-0721");
+        apply_enrichment(&store, &final_rows, true).await.unwrap();
 
         let remaining = store.all_model_profiles().unwrap();
         assert_eq!(remaining.len(), 1, "dry_run must not delete or upsert");
         assert_eq!(remaining[0].model, "deepseek/deepseek-v4-flash-0721");
+    }
+
+    #[test]
+    fn print_summary_prints_a_header_and_rows() {
+        let rows = vec![EnrichedRow {
+            model: "deepseek/deepseek-v4-flash-0731".into(),
+            reasoning: 80.0, coding: 90.0, frontend: 70.0, backend: 75.0,
+            math: 80.0, long_context: 90.0,
+            input_cost_per_m: 0.08, output_cost_per_m: 0.18, context_window: 1048576,
+            price_source: "opencode".into(),
+        }];
+        // Smoke test: must not panic for one row.
+        print_summary(&rows);
     }
 }
