@@ -35,6 +35,7 @@ pub async fn execute_subtasks(
     jobs: Vec<(String, String, rc_core::AgentConfig)>, // (subtask_id, prompt, config)
     store: &Store,
     concurrency: usize,
+    subtask_timeout: std::time::Duration,
     emit: Option<std::sync::Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     steer_hub: Option<std::sync::Arc<rc_core::SteerHub>>,
     cancel: Option<std::sync::Arc<AtomicBool>>,
@@ -80,13 +81,15 @@ pub async fn execute_subtasks(
         // 'static 边界,Arc 克隆可随 async move 一起进入任务)。
         let emit_for_task = emit.clone();
         let hub_for_task = steer_hub.clone();
+        let timeout_for_task = subtask_timeout;
         handles.push(tokio::spawn(async move {
             let _permit = permit;
             let model = config.provider.id().to_string();
             let agent = rc_core::Agent::new(config);
             // 每个子任务独立超时:防止挂死的 provider 无限占用信号量许可、拖垮整个 route。
+            // 时长来自配置(默认 600s),跑 cargo test 的编译型子任务需要更宽容限。
             let timed = tokio::time::timeout(
-                std::time::Duration::from_secs(300),
+                timeout_for_task,
                 async {
                     let start = std::time::Instant::now();
                     let mut last_beat = start;
@@ -239,6 +242,7 @@ pub async fn execute_subtasks_batched(
     jobs: Vec<(String, String, Vec<String>, rc_core::AgentConfig)>,
     store: &Store,
     concurrency: usize,
+    subtask_timeout: std::time::Duration,
     emit: Option<std::sync::Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     steer_hub: Option<std::sync::Arc<rc_core::SteerHub>>,
     cancel: Option<std::sync::Arc<AtomicBool>>,
@@ -269,7 +273,16 @@ pub async fn execute_subtasks_batched(
         }
         ready.reverse();
         let results =
-            execute_subtasks(ready, store, concurrency, emit.clone(), steer_hub.clone(), cancel.clone()).await;
+            execute_subtasks(
+                ready,
+                store,
+                concurrency,
+                subtask_timeout,
+                emit.clone(),
+                steer_hub.clone(),
+                cancel.clone(),
+            )
+            .await;
         for r in &results {
             done.insert(r.subtask_id.clone());
             if let Some(emit) = &emit {
@@ -356,7 +369,9 @@ mod tests {
             ("s1".to_string(), "do task one".to_string(), mock_config(&tmp, "mock-1")),
             ("s2".to_string(), "do task two".to_string(), mock_config(&tmp, "mock-2")),
         ];
-        let results = execute_subtasks(jobs, &store, 2, None, None, None).await;
+        let results =
+            execute_subtasks(jobs, &store, 2, std::time::Duration::from_secs(60), None, None, None)
+                .await;
 
         assert_eq!(results.len(), 2, "each sub-task must produce a SubtaskResult");
         assert!(results.iter().all(|r| r.ok));
@@ -384,7 +399,16 @@ mod tests {
             move |ev: AgentEvent| events.lock().unwrap().push(ev)
         };
         let results =
-            execute_subtasks(jobs, &store, 2, Some(Arc::new(sink)), None, None).await;
+            execute_subtasks(
+                jobs,
+                &store,
+                2,
+                std::time::Duration::from_secs(60),
+                Some(Arc::new(sink)),
+                None,
+                None,
+            )
+            .await;
 
         assert_eq!(results.len(), 1);
         assert!(results[0].ok);
@@ -421,11 +445,29 @@ mod tests {
         };
         // 取消置位 → 不启动任何子任务。
         let cancel = std::sync::Arc::new(AtomicBool::new(true));
-        let results = execute_subtasks(mk_jobs(), &store, 2, None, None, Some(cancel)).await;
+        let results = execute_subtasks(
+            mk_jobs(),
+            &store,
+            2,
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            Some(cancel),
+        )
+        .await;
         assert!(results.is_empty(), "cancelled run must not spawn sub-tasks");
         // 未取消 → 全部执行。
         let cancel2 = std::sync::Arc::new(AtomicBool::new(false));
-        let results2 = execute_subtasks(mk_jobs(), &store, 2, None, None, Some(cancel2)).await;
+        let results2 = execute_subtasks(
+            mk_jobs(),
+            &store,
+            2,
+            std::time::Duration::from_secs(60),
+            None,
+            None,
+            Some(cancel2),
+        )
+        .await;
         assert_eq!(results2.len(), 2);
     }
 
@@ -444,8 +486,16 @@ mod tests {
             let events = events.clone();
             move |ev: AgentEvent| events.lock().unwrap().push(ev)
         };
-        let results =
-            execute_subtasks_batched(jobs, &store, 2, Some(Arc::new(sink)), None, None).await;
+        let results = execute_subtasks_batched(
+            jobs,
+            &store,
+            2,
+            std::time::Duration::from_secs(60),
+            Some(Arc::new(sink)),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(results.len(), 3);
         // 回灌的 OrchestratorResult 应覆盖全部三个。
         let evs = events.lock().unwrap().clone();

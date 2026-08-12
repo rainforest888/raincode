@@ -526,6 +526,9 @@ struct CoreSection {
     max_history_bytes: Option<usize>,
     approval_mode: Option<String>,
     agent: Option<String>,
+    /// 单个 route 子任务的超时秒数(默认 600):跑 cargo test 的编译型子任务
+    /// 5 分钟(300s)常不够,之前 4 个 deepseek 子任务就是卡在编译被砍。
+    subtask_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -2627,10 +2630,13 @@ async fn route_command(
         });
     }
     // execute_subtasks_batched 按依赖分批执行,结果回灌 OrchestratorResult。
+    let subtask_timeout =
+        std::time::Duration::from_secs(config.core.subtask_timeout_secs.unwrap_or(600));
     let results = execute_subtasks_batched(
         jobs,
         &store,
         2,
+        subtask_timeout,
         emit.clone(),
         steer_hub,
         cancel.cloned(),
